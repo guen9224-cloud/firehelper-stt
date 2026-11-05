@@ -40,6 +40,7 @@ DG_URL = (
 
 SESSIONS: dict = {}   # sid -> {"lines":[{t,at}], "cues":[...]}
 VIEWERS: dict = {}    # sid -> set[WebSocket]  (앱 실시간 뷰어들)
+PRODUCERS: dict = {}  # sid -> WebSocket (안경 producer; AI 답변을 안경으로 푸시)
 
 
 def norm_sid(s) -> str:
@@ -116,7 +117,29 @@ async def view(ws: WebSocket):
             m = await ws.receive()
             if m.get("type") == "websocket.disconnect":
                 break
-            # Phase 2(AI 음성대화)에서 앱→Render 'ASK' 명령을 여기서 처리 예정
+            # 앱이 AI 답변을 보내면 → 안경(producer)에 카드로 푸시 + 세션에 저장
+            t = m.get("text")
+            if not t:
+                continue
+            try:
+                cmd = json.loads(t)
+            except Exception:
+                cmd = None
+            if cmd and cmd.get("type") == "ai_answer":
+                answer = str(cmd.get("answer", "")).strip()
+                title = (str(cmd.get("title", "")).strip() or "AI 답변")[:40]
+                if not answer:
+                    continue
+                at_iso = now_iso()
+                stx = SESSIONS.get(sid)
+                if stx is not None:
+                    stx["cues"].append({"type": "answer", "title": title, "body": answer, "src": "", "at": at_iso, "anchor": at_iso})
+                prod = PRODUCERS.get(sid)
+                if prod is not None:
+                    try:
+                        await prod.send_json({"card": {"type": "answer", "title": title, "body": answer[:300], "src": ""}})
+                    except Exception:
+                        pass
     except Exception:
         pass
     finally:
@@ -142,6 +165,7 @@ async def stt(ws: WebSocket):
 
     sid = norm_sid(ws.query_params.get("sid")) or uuid.uuid4().hex
     st = SESSIONS.setdefault(sid, {"lines": [], "cues": []})
+    PRODUCERS[sid] = ws   # AI 답변을 이 안경으로 푸시
     utter = []
     end_requested = {"v": False}
     last_save = {"t": 0.0}
@@ -201,8 +225,14 @@ async def stt(ws: WebSocket):
                             await dg.send(b)
                             continue
                         t = m.get("text")
-                        if t and t.strip().upper() == "END":
-                            end_requested["v"] = True
+                        if t:
+                            tt = t.strip().upper()
+                            if tt == "END":
+                                end_requested["v"] = True
+                            elif tt == "ASK":
+                                # 안경 왼쪽 탭 → 방금 말한 문장을 앱에 AI 질문 요청으로 전달
+                                q = st["lines"][-1]["t"] if st["lines"] else ""
+                                await broadcast(sid, {"ask_request": q})
                 except WebSocketDisconnect:
                     pass
                 finally:
@@ -264,6 +294,8 @@ async def stt(ws: WebSocket):
                 await client.aclose()
             except Exception:
                 pass
+        if PRODUCERS.get(sid) is ws:
+            PRODUCERS.pop(sid, None)
         if end_requested["v"]:
             SESSIONS.pop(sid, None)
         try:
