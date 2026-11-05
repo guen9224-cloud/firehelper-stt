@@ -285,6 +285,25 @@ async def stt(ws: WebSocket):
             try: await ws.send_json({"todos": [], "todo_err": str(e)[:120]})
             except Exception: pass
 
+    async def fetch_schedule():
+        # 안경 '일정' 뷰 요청(SCHED) → conversate로 오늘 + 다음 일정 있는 날 조회 → 안경에 내려줌
+        if not CUE_ON or client is None:
+            try: await ws.send_json({"sched": {"today": [], "next": []}})
+            except Exception: pass
+            return
+        try:
+            r = await client.post(CONV_URL, headers=CONV_HEADERS, json={
+                "action": "glasses_schedule", "uid": st.get("uid") or OWNER_UID,
+            })
+            d = r.json()
+            await ws.send_json({"sched": {
+                "today": d.get("today") or [], "next": d.get("next") or [],
+                "today_date": d.get("today_date") or "", "next_date": d.get("next_date") or "",
+            }})
+        except Exception as e:
+            try: await ws.send_json({"sched": {"today": [], "next": []}, "sched_err": str(e)[:120]})
+            except Exception: pass
+
     try:
         async with websockets.connect(DG_URL, extra_headers={"Authorization": f"Token {DG_KEY}"}) as dg:
             async def pump_client_to_dg():
@@ -309,6 +328,9 @@ async def stt(ws: WebSocket):
                             elif tt == "TODOS":
                                 # 안경 할일목록 뷰 → 미완료 할 일 조회해 안경에 전달
                                 asyncio.create_task(fetch_todos())
+                            elif tt == "SCHED":
+                                # 안경 일정 뷰 → 오늘·내일 일정 조회해 안경에 전달
+                                asyncio.create_task(fetch_schedule())
                 except WebSocketDisconnect:
                     pass
                 finally:
