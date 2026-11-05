@@ -1,11 +1,12 @@
-# firehelper-stt — 플러그인(폰) ↔ Deepgram STT + conversate 소방 카드 + 세션 기록
-#   플러그인이 /stt?sid=<세션id> 로 접속해 PCM(16kHz·16bit LE·mono)을 보내면:
-#     ① Deepgram 한국어 실시간 전사
-#     ② 한 문장 끝날 때마다 conversate(cue) 호출 → 소방 카드를 {card} 로 push
-#     ③ 전사·카드를 conversate(glasses_save)로 주기 저장 → 앱 '지난 대화'에 그대로
-#     ④ 플러그인이 "END"(두 번 탭 종료) 보내면 finalize=true 로 요약까지 생성
-#   전사는 화면에 안 보냄(백그라운드 기록). 플러그인엔 카드만 보냄.
-#   키는 전부 Render 환경변수로만. 플러그인엔 아무 키도 안 들어감.
+# firehelper-stt — 플러그인(폰) ↔ Deepgram STT + conversate 소방 카드 + 세션 기록 + 앱 실시간 뷰어
+#   안경 플러그인: /stt?sid=<세션id> 로 PCM(16kHz·16bit LE·mono) 전송 (producer)
+#   파이어헬퍼 앱:  /view?sid=<세션id> 로 접속해 전사(단어 단위)·카드를 실시간 수신 (viewer)
+#   흐름:
+#     ① Deepgram 한국어 실시간 전사 → 모든 viewer 에게 {text, final} 브로드캐스트(단어 단위)
+#     ② 한 문장 끝날 때 conversate(cue) → 소방 카드 → 안경(producer)과 앱(viewer) 둘 다에 {card}
+#     ③ 전사·카드를 conversate(glasses_save)로 주기 저장 → 앱 '지난 대화'
+#     ④ 플러그인이 "END"(두 번 탭) 보내면 종료(요약은 앱에서 수동)
+#   키는 전부 Render 환경변수로만. 플러그인/앱엔 아무 키도 안 들어감.
 #     DEEPGRAM_API_KEY / SUPABASE_URL / SUPABASE_ANON_KEY / GLASSES_TOKEN / OWNER_UID
 import os, json, asyncio, time, uuid
 from datetime import datetime, timezone
@@ -20,7 +21,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
 GLASSES_TOKEN = os.environ.get("GLASSES_TOKEN", "")
 OWNER_UID = os.environ.get("OWNER_UID", "")
-CARD_FREQ = os.environ.get("CARD_FREQ", "normal")  # many / normal / few
+CARD_FREQ = os.environ.get("CARD_FREQ", "normal")
 CONV_URL = (SUPABASE_URL + "/functions/v1/conversate") if SUPABASE_URL else ""
 CUE_ON = bool(CONV_URL and GLASSES_TOKEN and OWNER_UID)
 CONV_HEADERS = {
@@ -29,7 +30,7 @@ CONV_HEADERS = {
     "apikey": SUPABASE_ANON_KEY,
     "x-fh-glasses": GLASSES_TOKEN,
 }
-SAVE_EVERY = 12  # 주기 저장 최소 간격(초)
+SAVE_EVERY = 12  # DB 주기 저장 최소 간격(초)
 
 DG_URL = (
     "wss://api.deepgram.com/v1/listen"
@@ -37,37 +38,100 @@ DG_URL = (
     "&interim_results=true&punctuate=true&smart_format=true&endpointing=300"
 )
 
-# 같은 세션(sid)으로 재접속해도 전사·카드가 이어지게 프로세스 메모리에 보관
-SESSIONS: dict = {}
+SESSIONS: dict = {}   # sid -> {"lines":[{t,at}], "cues":[...]}
+VIEWERS: dict = {}    # sid -> set[WebSocket]  (앱 실시간 뷰어들)
+
+
+def norm_sid(s) -> str:
+    return (s or "").replace("-", "").lower().strip()[:40]
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+async def broadcast(sid: str, obj: dict):
+    dead = []
+    for v in list(VIEWERS.get(sid, set())):
+        try:
+            await v.send_json(obj)
+        except Exception:
+            dead.append(v)
+    if dead:
+        s = VIEWERS.get(sid)
+        if s:
+            for v in dead:
+                s.discard(v)
+
+
 @app.get("/")
 def health():
-    return {"ok": True, "has_key": bool(DG_KEY), "cue": CUE_ON}
+    return {"ok": True, "has_key": bool(DG_KEY), "cue": CUE_ON,
+            "sessions": len(SESSIONS), "viewers": sum(len(v) for v in VIEWERS.values())}
 
 
-async def save_session(client, sid, st, finalize):
-    if not CUE_ON or client is None or not st["lines"]:
+async def save_session(client, sid, st, finalize, force=False):
+    if not CUE_ON or client is None:
+        return
+    if not st["lines"] and not force:
         return
     payload = {
-        "action": "glasses_save",
-        "uid": OWNER_UID,
-        "session_id": sid,
-        "transcript": st["lines"],
-        "cues": st["cues"],
-        "finalize": bool(finalize),
+        "action": "glasses_save", "uid": OWNER_UID, "session_id": sid,
+        "transcript": st["lines"], "cues": st["cues"], "finalize": bool(finalize),
     }
     try:
         await client.post(CONV_URL, headers=CONV_HEADERS, json=payload,
-                           timeout=(130.0 if finalize else 20.0))
+                          timeout=(60.0 if finalize else 20.0))
     except Exception:
         pass
 
 
+# ───────── 앱 실시간 뷰어 ─────────
+@app.websocket("/view")
+async def view(ws: WebSocket):
+    await ws.accept()
+    sid = norm_sid(ws.query_params.get("sid"))
+    if not sid:
+        try:
+            await ws.send_json({"error": "no sid"})
+        except Exception:
+            pass
+        await ws.close()
+        return
+    VIEWERS.setdefault(sid, set()).add(ws)
+    # 지금까지 쌓인 전사·카드 스냅샷 먼저(앱이 바로 이어 보게)
+    st = SESSIONS.get(sid)
+    try:
+        await ws.send_json({
+            "snapshot": {
+                "lines": [l["t"] for l in (st["lines"] if st else [])],
+                "cards": (st["cues"] if st else []),
+                "live": st is not None,
+            }
+        })
+    except Exception:
+        pass
+    try:
+        while True:
+            m = await ws.receive()
+            if m.get("type") == "websocket.disconnect":
+                break
+            # Phase 2(AI 음성대화)에서 앱→Render 'ASK' 명령을 여기서 처리 예정
+    except Exception:
+        pass
+    finally:
+        s = VIEWERS.get(sid)
+        if s:
+            s.discard(ws)
+            if not s:
+                VIEWERS.pop(sid, None)
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
+# ───────── 안경 플러그인(오디오 producer) ─────────
 @app.websocket("/stt")
 async def stt(ws: WebSocket):
     await ws.accept()
@@ -76,21 +140,23 @@ async def stt(ws: WebSocket):
         await ws.close()
         return
 
-    sid = (ws.query_params.get("sid") or uuid.uuid4().hex).strip()[:40]
+    sid = norm_sid(ws.query_params.get("sid")) or uuid.uuid4().hex
     st = SESSIONS.setdefault(sid, {"lines": [], "cues": []})
     utter = []
     end_requested = {"v": False}
     last_save = {"t": 0.0}
     client = httpx.AsyncClient(timeout=20.0) if CUE_ON else None
 
+    # 접속 즉시 세션 행 생성(앱이 sid 를 바로 찾을 수 있게)
+    if client is not None:
+        asyncio.create_task(save_session(client, sid, st, False, force=True))
+
     async def fetch_cue(latest: str, at_iso: str):
         if not CUE_ON or client is None:
             return
         try:
             r = await client.post(CONV_URL, headers=CONV_HEADERS, json={
-                "action": "cue",
-                "uid": OWNER_UID,
-                "latest": latest,
+                "action": "cue", "uid": OWNER_UID, "latest": latest,
                 "transcript": [l["t"] for l in st["lines"][-12:]],
                 "recent": [c["title"] for c in st["cues"][-10:]],
                 "cardFreq": CARD_FREQ,
@@ -111,7 +177,11 @@ async def stt(ws: WebSocket):
                     db_card["todo_title"] = c.get("todo_title", "")
                     db_card["todo_due"] = c.get("todo_due", "")
                 st["cues"].append(db_card)
-                await ws.send_json({"card": c})  # 전체 카드(ask 포함)를 플러그인에
+                try:
+                    await ws.send_json({"card": c})   # 안경(producer)
+                except Exception:
+                    pass
+                await broadcast(sid, {"card": c})      # 앱(viewer)
         except Exception as e:
             try:
                 await ws.send_json({"cue_err": str(e)[:120]})
@@ -151,6 +221,8 @@ async def stt(ws: WebSocket):
                             continue
                         is_final = bool(d.get("is_final"))
                         speech_final = bool(d.get("speech_final"))
+                        # 앱에 단어 단위 실시간 전사(중간결과 포함)
+                        await broadcast(sid, {"text": text, "final": is_final})
                         if is_final:
                             utter.append(text)
                         if speech_final:
@@ -161,7 +233,7 @@ async def stt(ws: WebSocket):
                             at_iso = now_iso()
                             st["lines"].append({"t": latest, "at": at_iso})
                             try:
-                                await ws.send_json({"hb": True})  # 마이크 살아있음 신호(선택)
+                                await ws.send_json({"hb": True})   # 안경: 마이크 살아있음
                             except Exception:
                                 pass
                             core = "".join(ch for ch in latest if ch.isalnum())
@@ -180,9 +252,9 @@ async def stt(ws: WebSocket):
         except Exception:
             pass
     finally:
-        # 마지막 카드 요청이 끝나도록 잠깐 여유
         if end_requested["v"]:
             await asyncio.sleep(1.2)
+            await broadcast(sid, {"ended": True})
         if client is not None:
             try:
                 await save_session(client, sid, st, end_requested["v"])
