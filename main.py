@@ -10,11 +10,13 @@
 #     DEEPGRAM_API_KEY / SUPABASE_URL / SUPABASE_ANON_KEY / GLASSES_TOKEN / OWNER_UID
 import os, json, asyncio, time, uuid
 from datetime import datetime, timezone
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.middleware.cors import CORSMiddleware
 import websockets
 import httpx
 
 app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 DG_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
@@ -38,13 +40,36 @@ DG_URL = (
     "&interim_results=true&punctuate=true&smart_format=true&endpointing=300"
 )
 
-SESSIONS: dict = {}   # sid -> {"lines":[{t,at}], "cues":[...]}
+SESSIONS: dict = {}   # sid -> {"lines":[{t,at}], "cues":[...], "uid": <사용자>}
 VIEWERS: dict = {}    # sid -> set[WebSocket]  (앱 실시간 뷰어들)
 PRODUCERS: dict = {}  # sid -> WebSocket (안경 producer; AI 답변을 안경으로 푸시)
+TOKEN_UID: dict = {}  # device_token -> uid (페어링 캐시)
 
 
 def norm_sid(s) -> str:
     return (s or "").replace("-", "").lower().strip()[:40]
+
+
+async def resolve_uid(device_token: str) -> str:
+    # 안경 기기토큰 → 사용자 uid. 토큰 없으면 소유자(OWNER_UID) 기본값(미페어링 안경).
+    t = (device_token or "").strip()
+    if not t:
+        return OWNER_UID
+    if t in TOKEN_UID:
+        return TOKEN_UID[t]
+    if not CUE_ON:
+        return OWNER_UID
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as cli:
+            r = await cli.post(CONV_URL, headers=CONV_HEADERS, json={"action": "glasses_whoami", "device_token": t})
+            d = r.json()
+            u = d.get("uid")
+            if u:
+                TOKEN_UID[t] = u
+                return u
+    except Exception:
+        pass
+    return OWNER_UID
 
 
 def now_iso() -> str:
@@ -71,13 +96,33 @@ def health():
             "sessions": len(SESSIONS), "viewers": sum(len(v) for v in VIEWERS.values())}
 
 
+@app.post("/pair")
+async def pair(req: Request):
+    # 플러그인(폰)이 6자리 코드를 보내면 conversate로 교환해 device_token 반환
+    if not CUE_ON:
+        return {"error": "not_configured"}
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    code = "".join(ch for ch in str(body.get("code", "")) if ch.isdigit())
+    if len(code) != 6:
+        return {"error": "bad_code"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as cli:
+            r = await cli.post(CONV_URL, headers=CONV_HEADERS, json={"action": "glasses_claim", "code": code})
+            return r.json()
+    except Exception as e:
+        return {"error": str(e)[:120]}
+
+
 async def save_session(client, sid, st, finalize, force=False):
     if not CUE_ON or client is None:
         return
     if not st["lines"] and not force:
         return
     payload = {
-        "action": "glasses_save", "uid": OWNER_UID, "session_id": sid,
+        "action": "glasses_save", "uid": st.get("uid") or OWNER_UID, "session_id": sid,
         "transcript": st["lines"], "cues": st["cues"], "finalize": bool(finalize),
     }
     try:
@@ -171,6 +216,7 @@ async def stt(ws: WebSocket):
 
     sid = norm_sid(ws.query_params.get("sid")) or uuid.uuid4().hex
     st = SESSIONS.setdefault(sid, {"lines": [], "cues": []})
+    st["uid"] = await resolve_uid(ws.query_params.get("token"))   # 페어링 토큰 → 사용자
     PRODUCERS[sid] = ws   # AI 답변을 이 안경으로 푸시
     utter = []
     end_requested = {"v": False}
@@ -186,7 +232,7 @@ async def stt(ws: WebSocket):
             return
         try:
             r = await client.post(CONV_URL, headers=CONV_HEADERS, json={
-                "action": "cue", "uid": OWNER_UID, "latest": latest,
+                "action": "cue", "uid": st.get("uid") or OWNER_UID, "latest": latest,
                 "transcript": [l["t"] for l in st["lines"][-12:]],
                 "recent": [c["title"] for c in st["cues"][-10:]],
                 "cardFreq": CARD_FREQ,
