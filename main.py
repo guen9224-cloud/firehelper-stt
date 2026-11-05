@@ -263,7 +263,7 @@ async def stt(ws: WebSocket):
                             at_iso = now_iso()
                             st["lines"].append({"t": latest, "at": at_iso})
                             try:
-                                await ws.send_json({"hb": True})   # 안경: 마이크 살아있음
+                                await ws.send_json({"line": latest})   # 안경: 전사 한 줄(전사+카드 보기용)
                             except Exception:
                                 pass
                             core = "".join(ch for ch in latest if ch.isalnum())
@@ -284,12 +284,14 @@ async def stt(ws: WebSocket):
     finally:
         if end_requested["v"]:
             await asyncio.sleep(1.2)
-            await broadcast(sid, {"ended": True})
         if client is not None:
             try:
-                await save_session(client, sid, st, end_requested["v"])
+                await save_session(client, sid, st, end_requested["v"])   # 먼저 저장
             except Exception:
                 pass
+        if end_requested["v"]:
+            await broadcast(sid, {"ended": True})   # 저장 뒤 앱에 '저장됨' 신호
+        if client is not None:
             try:
                 await client.aclose()
             except Exception:
