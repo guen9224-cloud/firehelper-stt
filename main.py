@@ -269,6 +269,22 @@ async def stt(ws: WebSocket):
             except Exception:
                 pass
 
+    async def fetch_todos():
+        # 안경 '할일목록' 뷰 요청(TODOS) → conversate로 미완료 할 일 조회 → 안경에 내려줌
+        if not CUE_ON or client is None:
+            try: await ws.send_json({"todos": []})
+            except Exception: pass
+            return
+        try:
+            r = await client.post(CONV_URL, headers=CONV_HEADERS, json={
+                "action": "glasses_todos", "uid": st.get("uid") or OWNER_UID,
+            })
+            d = r.json()
+            await ws.send_json({"todos": d.get("todos") or []})
+        except Exception as e:
+            try: await ws.send_json({"todos": [], "todo_err": str(e)[:120]})
+            except Exception: pass
+
     try:
         async with websockets.connect(DG_URL, extra_headers={"Authorization": f"Token {DG_KEY}"}) as dg:
             async def pump_client_to_dg():
@@ -290,6 +306,9 @@ async def stt(ws: WebSocket):
                                 # 안경 왼쪽 탭 → 방금 말한 문장을 앱에 AI 질문 요청으로 전달
                                 q = st["lines"][-1]["t"] if st["lines"] else ""
                                 await broadcast(sid, {"ask_request": q})
+                            elif tt == "TODOS":
+                                # 안경 할일목록 뷰 → 미완료 할 일 조회해 안경에 전달
+                                asyncio.create_task(fetch_todos())
                 except WebSocketDisconnect:
                     pass
                 finally:
