@@ -263,6 +263,9 @@ async def stt(ws: WebSocket):
             if added:
                 last_save["t"] = time.time()
                 await save_session(client, sid, st, False)   # 카드 뜨면 즉시 저장
+            # 할 일 완료 카드가 떴으면 안경 할일목록을 즉시 갱신(완료된 건 사라지게)
+            if any(c and c.get("type") == "todo_done" for c in cues):
+                asyncio.create_task(fetch_todos())
         except Exception as e:
             try:
                 await ws.send_json({"cue_err": str(e)[:120]})
