@@ -140,6 +140,12 @@ async def view(ws: WebSocket):
                         await prod.send_json({"card": {"type": "answer", "title": title, "body": answer[:300], "src": ""}})
                     except Exception:
                         pass
+                if stx is not None and CUE_ON:   # AI 답변 즉시 저장(세션에 남게)
+                    try:
+                        async with httpx.AsyncClient(timeout=20.0) as cli:
+                            await save_session(cli, sid, stx, False)
+                    except Exception:
+                        pass
     except Exception:
         pass
     finally:
@@ -189,6 +195,7 @@ async def stt(ws: WebSocket):
             cues = d.get("cues")
             if not cues:
                 cues = [d["cue"]] if d.get("cue") else []
+            added = False
             for c in cues:
                 if not c:
                     continue
@@ -201,11 +208,15 @@ async def stt(ws: WebSocket):
                     db_card["todo_title"] = c.get("todo_title", "")
                     db_card["todo_due"] = c.get("todo_due", "")
                 st["cues"].append(db_card)
+                added = True
                 try:
                     await ws.send_json({"card": c})   # 안경(producer)
                 except Exception:
                     pass
                 await broadcast(sid, {"card": c})      # 앱(viewer)
+            if added:
+                last_save["t"] = time.time()
+                await save_session(client, sid, st, False)   # 카드 뜨면 즉시 저장
         except Exception as e:
             try:
                 await ws.send_json({"cue_err": str(e)[:120]})
@@ -251,8 +262,12 @@ async def stt(ws: WebSocket):
                             continue
                         is_final = bool(d.get("is_final"))
                         speech_final = bool(d.get("speech_final"))
-                        # 앱에 단어 단위 실시간 전사(중간결과 포함)
+                        # 앱·안경 둘 다에 단어 단위 실시간 전사(중간결과 포함)
                         await broadcast(sid, {"text": text, "final": is_final})
+                        try:
+                            await ws.send_json({"text": text, "final": is_final})
+                        except Exception:
+                            pass
                         if is_final:
                             utter.append(text)
                         if speech_final:
@@ -262,10 +277,6 @@ async def stt(ws: WebSocket):
                                 continue
                             at_iso = now_iso()
                             st["lines"].append({"t": latest, "at": at_iso})
-                            try:
-                                await ws.send_json({"line": latest})   # 안경: 전사 한 줄(전사+카드 보기용)
-                            except Exception:
-                                pass
                             core = "".join(ch for ch in latest if ch.isalnum())
                             if CUE_ON and len(core) >= 4:
                                 asyncio.create_task(fetch_cue(latest, at_iso))
