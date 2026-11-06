@@ -191,7 +191,7 @@ async def view(ws: WebSocket):
                 prod = PRODUCERS.get(sid)
                 if prod is not None:
                     try:
-                        await prod.send_json({"card": {"type": "answer", "title": title, "body": answer, "src": ""}})
+                        await prod.send_json({"card": {"type": "answer", "title": title, "body": clean_md(answer), "src": ""}})
                     except Exception:
                         pass
                 await broadcast(sid, {"ai": {"q": q, "a": answer}})   # 앱 실시간에 전체 답변
@@ -268,7 +268,7 @@ async def stt(ws: WebSocket):
                         dd = ev.get("delta")
                         if isinstance(dd, str):
                             answer += dd
-            answer = clean_md(answer)
+            answer = answer.strip()
             if not answer:
                 try:
                     await ws.send_json({"cue_err": "AI 답변 비어있음"})
@@ -279,7 +279,7 @@ async def stt(ws: WebSocket):
             title = (question[:30] + "…") if len(question) > 30 else (question or "AI 답변")
             st["cues"].append({"type": "answer", "title": title, "body": answer, "q": question, "src": "", "at": at_iso, "anchor": at_iso})
             try:
-                await ws.send_json({"card": {"type": "answer", "title": title, "body": answer, "src": ""}})
+                await ws.send_json({"card": {"type": "answer", "title": title, "body": clean_md(answer), "src": ""}})
             except Exception:
                 pass
             await broadcast(sid, {"ai": {"q": question, "a": answer}})
