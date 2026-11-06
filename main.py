@@ -219,6 +219,7 @@ async def stt(ws: WebSocket):
     st["uid"] = await resolve_uid(ws.query_params.get("token"))   # 페어링 토큰 → 사용자
     PRODUCERS[sid] = ws   # AI 답변을 이 안경으로 푸시
     utter = []
+    last_seg = {"t": 0.0}
     end_requested = {"v": False}
     last_save = {"t": 0.0}
     client = httpx.AsyncClient(timeout=20.0) if CUE_ON else None
@@ -308,7 +309,55 @@ async def stt(ws: WebSocket):
             except Exception: pass
 
     try:
-        async with websockets.connect(DG_URL, extra_headers={"Authorization": f"Token {DG_KEY}"}) as dg:
+        async with websockets.connect(
+            DG_URL,
+            extra_headers={"Authorization": f"Token {DG_KEY}"},
+            ping_interval=10, ping_timeout=30, close_timeout=5, max_size=None,
+        ) as dg:
+            # 무음/프레임 공백에도 Deepgram 소켓이 유휴로 닫히지 않게 주기 KeepAlive
+            async def keepalive_dg():
+                try:
+                    while True:
+                        await asyncio.sleep(7)
+                        try:
+                            await dg.send(json.dumps({"type": "KeepAlive"}))
+                        except Exception:
+                            break
+                except asyncio.CancelledError:
+                    pass
+
+            flushing = {"v": False}
+            async def flush_utter():
+                # 누적된 문장을 확정 → 세션 저장 + 소방 카드. speech_final 없이도 호출됨.
+                if flushing["v"]:
+                    return
+                latest = " ".join(utter).strip()
+                if not latest:
+                    return
+                flushing["v"] = True
+                try:
+                    utter.clear()
+                    at_iso = now_iso()
+                    st["lines"].append({"t": latest, "at": at_iso})
+                    core = "".join(ch for ch in latest if ch.isalnum())
+                    if CUE_ON and len(core) >= 4:
+                        asyncio.create_task(fetch_cue(latest, at_iso))
+                    if client is not None:
+                        last_save["t"] = time.time()
+                        asyncio.create_task(save_session(client, sid, st, False))
+                finally:
+                    flushing["v"] = False
+
+            async def auto_flush():
+                # Deepgram speech_final이 안 와도, 말이 ~1.2s 멈추면 스스로 문장 확정
+                try:
+                    while True:
+                        await asyncio.sleep(0.5)
+                        if utter and (time.time() - last_seg["t"]) >= 1.2:
+                            await flush_utter()
+                except asyncio.CancelledError:
+                    pass
+
             async def pump_client_to_dg():
                 try:
                     while True:
@@ -324,6 +373,7 @@ async def stt(ws: WebSocket):
                             tt = t.strip().upper()
                             if tt == "END":
                                 end_requested["v"] = True
+                                await flush_utter()
                             elif tt == "ASK":
                                 # 안경 왼쪽 탭 → 방금 말한 문장을 앱에 AI 질문 요청으로 전달
                                 q = st["lines"][-1]["t"] if st["lines"] else ""
@@ -360,23 +410,19 @@ async def stt(ws: WebSocket):
                             pass
                         if is_final:
                             utter.append(text)
+                            last_seg["t"] = time.time()
                         if speech_final:
-                            latest = " ".join(utter).strip()
-                            utter.clear()
-                            if not latest:
-                                continue
-                            at_iso = now_iso()
-                            st["lines"].append({"t": latest, "at": at_iso})
-                            core = "".join(ch for ch in latest if ch.isalnum())
-                            if CUE_ON and len(core) >= 4:
-                                asyncio.create_task(fetch_cue(latest, at_iso))
-                            if client is not None and (time.time() - last_save["t"]) >= SAVE_EVERY:
-                                last_save["t"] = time.time()
-                                asyncio.create_task(save_session(client, sid, st, False))
+                            await flush_utter()
                     except Exception:
                         pass
 
-            await asyncio.gather(pump_client_to_dg(), pump_dg_to_client())
+            ka = asyncio.create_task(keepalive_dg())
+            af = asyncio.create_task(auto_flush())
+            try:
+                await asyncio.gather(pump_client_to_dg(), pump_dg_to_client())
+            finally:
+                ka.cancel()
+                af.cancel()
     except Exception as e:
         try:
             await ws.send_json({"error": str(e)[:200]})
