@@ -380,6 +380,10 @@ async def stt(ws: WebSocket):
                                 # 안경 왼쪽 탭 → 방금 말한 문장을 앱에 AI 질문 요청으로 전달
                                 q = st["lines"][-1]["t"] if st["lines"] else ""
                                 await broadcast(sid, {"ask_request": q})
+                                try:
+                                    await ws.send_json({"asked": q})   # 안경에 실제 질문 문장 표시
+                                except Exception:
+                                    pass
                             elif tt == "TODOS":
                                 # 안경 할일목록 뷰 → 미완료 할 일 조회해 안경에 전달
                                 asyncio.create_task(fetch_todos())
