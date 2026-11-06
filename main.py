@@ -183,7 +183,7 @@ async def view(ws: WebSocket):
                 prod = PRODUCERS.get(sid)
                 if prod is not None:
                     try:
-                        await prod.send_json({"card": {"type": "answer", "title": title, "body": answer[:300], "src": ""}})
+                        await prod.send_json({"card": {"type": "answer", "title": title, "body": answer, "src": ""}})
                     except Exception:
                         pass
                 await broadcast(sid, {"ai": {"q": q, "a": answer}})   # 앱 실시간에 전체 답변
@@ -223,6 +223,7 @@ async def stt(ws: WebSocket):
     utter = []
     last_seg = {"t": 0.0}
     end_requested = {"v": False}
+    ask_next = {"v": False}            # 다음 확정 문장을 AI 질문으로(카드 제외)
     last_save = {"t": 0.0}
     client = httpx.AsyncClient(timeout=20.0) if CUE_ON else None
 
@@ -341,9 +342,17 @@ async def stt(ws: WebSocket):
                     utter.clear()
                     at_iso = now_iso()
                     st["lines"].append({"t": latest, "at": at_iso})
-                    core = "".join(ch for ch in latest if ch.isalnum())
-                    if CUE_ON and len(core) >= 4:
-                        asyncio.create_task(fetch_cue(latest, at_iso))
+                    if ask_next["v"]:
+                        ask_next["v"] = False
+                        try:
+                            await ws.send_json({"asked": latest})   # 안경에 질문 문장 표시
+                        except Exception:
+                            pass
+                        await broadcast(sid, {"ask_request": latest})   # 이 문장은 카드 없이 AI 질문으로
+                    else:
+                        core = "".join(ch for ch in latest if ch.isalnum())
+                        if CUE_ON and len(core) >= 4:
+                            asyncio.create_task(fetch_cue(latest, at_iso))
                     if client is not None:
                         last_save["t"] = time.time()
                         asyncio.create_task(save_session(client, sid, st, False))
@@ -376,14 +385,11 @@ async def stt(ws: WebSocket):
                             if tt == "END":
                                 end_requested["v"] = True
                                 await flush_utter()
-                            elif tt == "ASK":
-                                # 안경 왼쪽 탭 → 방금 말한 문장을 앱에 AI 질문 요청으로 전달
-                                q = st["lines"][-1]["t"] if st["lines"] else ""
-                                await broadcast(sid, {"ask_request": q})
-                                try:
-                                    await ws.send_json({"asked": q})   # 안경에 실제 질문 문장 표시
-                                except Exception:
-                                    pass
+                            elif tt == "ASKNEXT":
+                                # 안경 오른쪽 탭 → 탭 이후 처음 확정되는 문장을 AI 질문으로(카드 제외)
+                                ask_next["v"] = True
+                            elif tt == "ASKCANCEL":
+                                ask_next["v"] = False
                             elif tt == "TODOS":
                                 # 안경 할일목록 뷰 → 미완료 할 일 조회해 안경에 전달
                                 asyncio.create_task(fetch_todos())
