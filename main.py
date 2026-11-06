@@ -25,6 +25,7 @@ GLASSES_TOKEN = os.environ.get("GLASSES_TOKEN", "")
 OWNER_UID = os.environ.get("OWNER_UID", "")
 CARD_FREQ = os.environ.get("CARD_FREQ", "normal")
 CONV_URL = (SUPABASE_URL + "/functions/v1/conversate") if SUPABASE_URL else ""
+AI_URL = (SUPABASE_URL + "/functions/v1/firehelper-ai") if SUPABASE_URL else ""
 CUE_ON = bool(CONV_URL and GLASSES_TOKEN and OWNER_UID)
 CONV_HEADERS = {
     "Content-Type": "application/json",
@@ -231,6 +232,57 @@ async def stt(ws: WebSocket):
     if client is not None:
         asyncio.create_task(save_session(client, sid, st, False, force=True))
 
+    async def fetch_ai_answer(question: str):
+        # 안경 질문 → 서버가 firehelper-ai 직접 호출(앱 없이도 동작). SSE data:{delta} 누적.
+        if not CUE_ON or client is None or not AI_URL:
+            return
+        try:
+            r = await client.post(AI_URL, headers=CONV_HEADERS, json={
+                "message": question, "uid": st.get("uid") or OWNER_UID,
+            }, timeout=90.0)
+            txt = r.text
+            tt = txt.strip()
+            if tt.startswith("{"):
+                try:
+                    o = json.loads(tt)
+                    if o.get("error"):
+                        await ws.send_json({"cue_err": "AI: " + str(o.get("error"))[:80]})
+                        return
+                except Exception:
+                    pass
+            answer = ""
+            for block in txt.split("\n\n"):
+                for line in block.split("\n"):
+                    if line.startswith("data:"):
+                        try:
+                            ev = json.loads(line[5:].strip())
+                        except Exception:
+                            continue
+                        dd = ev.get("delta")
+                        if isinstance(dd, str):
+                            answer += dd
+            answer = answer.strip()
+            if not answer:
+                try:
+                    await ws.send_json({"cue_err": "AI 답변 비어있음"})
+                except Exception:
+                    pass
+                return
+            at_iso = now_iso()
+            title = (question[:30] + "…") if len(question) > 30 else (question or "AI 답변")
+            st["cues"].append({"type": "answer", "title": title, "body": answer, "q": question, "src": "", "at": at_iso, "anchor": at_iso})
+            try:
+                await ws.send_json({"card": {"type": "answer", "title": title, "body": answer, "src": ""}})
+            except Exception:
+                pass
+            await broadcast(sid, {"ai": {"q": question, "a": answer}})
+            await save_session(client, sid, st, False)
+        except Exception as e:
+            try:
+                await ws.send_json({"cue_err": str(e)[:120]})
+            except Exception:
+                pass
+
     async def fetch_cue(latest: str, at_iso: str):
         if not CUE_ON or client is None:
             return
@@ -348,7 +400,7 @@ async def stt(ws: WebSocket):
                             await ws.send_json({"asked": latest})   # 안경에 질문 문장 표시
                         except Exception:
                             pass
-                        await broadcast(sid, {"ask_request": latest})   # 이 문장은 카드 없이 AI 질문으로
+                        asyncio.create_task(fetch_ai_answer(latest))   # 서버가 직접 AI 호출(카드 없이)
                     else:
                         core = "".join(ch for ch in latest if ch.isalnum())
                         if CUE_ON and len(core) >= 4:
@@ -364,7 +416,8 @@ async def stt(ws: WebSocket):
                 try:
                     while True:
                         await asyncio.sleep(0.5)
-                        if utter and (time.time() - last_seg["t"]) >= 1.2:
+                        thr = 2.0 if ask_next["v"] else 1.2
+                        if utter and (time.time() - last_seg["t"]) >= thr:
                             await flush_utter()
                 except asyncio.CancelledError:
                     pass
@@ -423,7 +476,7 @@ async def stt(ws: WebSocket):
                         if is_final:
                             utter.append(text)
                             last_seg["t"] = time.time()
-                        if speech_final:
+                        if speech_final and not ask_next["v"]:
                             await flush_utter()
                     except Exception:
                         pass
