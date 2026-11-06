@@ -8,7 +8,7 @@
 #     ④ 플러그인이 "END"(두 번 탭) 보내면 종료(요약은 앱에서 수동)
 #   키는 전부 Render 환경변수로만. 플러그인/앱엔 아무 키도 안 들어감.
 #     DEEPGRAM_API_KEY / SUPABASE_URL / SUPABASE_ANON_KEY / GLASSES_TOKEN / OWNER_UID
-import os, json, asyncio, time, uuid
+import os, json, asyncio, time, uuid, re
 from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -71,6 +71,13 @@ async def resolve_uid(device_token: str) -> str:
     except Exception:
         pass
     return OWNER_UID
+
+
+def clean_md(t: str) -> str:
+    # 마크다운 기호 제거(안경·앱 전부 평문으로)
+    t = re.sub(r"[#*`_>]", "", t or "")
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
 
 
 def now_iso() -> str:
@@ -261,7 +268,7 @@ async def stt(ws: WebSocket):
                         dd = ev.get("delta")
                         if isinstance(dd, str):
                             answer += dd
-            answer = answer.strip()
+            answer = clean_md(answer)
             if not answer:
                 try:
                     await ws.send_json({"cue_err": "AI 답변 비어있음"})
@@ -439,7 +446,8 @@ async def stt(ws: WebSocket):
                                 end_requested["v"] = True
                                 await flush_utter()
                             elif tt == "ASKNEXT":
-                                # 안경 오른쪽 탭 → 탭 이후 처음 확정되는 문장을 AI 질문으로(카드 제외)
+                                # 탭 전 전사는 일반 라인으로 흘려보내고(질문에 안 섞임), 이후 문장을 질문으로
+                                await flush_utter()
                                 ask_next["v"] = True
                             elif tt == "ASKCANCEL":
                                 ask_next["v"] = False
