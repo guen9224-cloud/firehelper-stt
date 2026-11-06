@@ -173,18 +173,20 @@ async def view(ws: WebSocket):
             if cmd and cmd.get("type") == "ai_answer":
                 answer = str(cmd.get("answer", "")).strip()
                 title = (str(cmd.get("title", "")).strip() or "AI 답변")[:40]
+                q = str(cmd.get("q", "")).strip()
                 if not answer:
                     continue
                 at_iso = now_iso()
                 stx = SESSIONS.get(sid)
                 if stx is not None:
-                    stx["cues"].append({"type": "answer", "title": title, "body": answer, "src": "", "at": at_iso, "anchor": at_iso})
+                    stx["cues"].append({"type": "answer", "title": title, "body": answer, "q": q, "src": "", "at": at_iso, "anchor": at_iso})
                 prod = PRODUCERS.get(sid)
                 if prod is not None:
                     try:
                         await prod.send_json({"card": {"type": "answer", "title": title, "body": answer[:300], "src": ""}})
                     except Exception:
                         pass
+                await broadcast(sid, {"ai": {"q": q, "a": answer}})   # 앱 실시간에 전체 답변
                 if stx is not None and CUE_ON:   # AI 답변 즉시 저장(세션에 남게)
                     try:
                         async with httpx.AsyncClient(timeout=20.0) as cli:
