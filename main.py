@@ -59,6 +59,38 @@ FAST_TERMS = [
 ]
 _FAST_SHOWN: dict = {}   # sid -> set(term)  세션당 같은 용어 재발 방지
 
+_DEFS: dict = {}          # term -> {"body","src"}  화재안전기준 '정의' 전체
+_DEF_TERMS: list = []     # 매칭용(긴 용어 우선)
+_DEFS_LOADED = False
+
+async def load_defs(client):
+    # 화재안전기준 '정의' 전체를 1회 로드(fast_defs RPC) → 메모리 매칭. 정의는 맥락 무관하게 항상 맞음.
+    global _DEFS, _DEF_TERMS, _DEFS_LOADED
+    if _DEFS_LOADED:
+        return
+    _DEFS_LOADED = True
+    try:
+        r = await client.post(
+            SUPABASE_URL + "/rest/v1/rpc/fast_defs",
+            json={},
+            headers={"apikey": SUPABASE_ANON_KEY, "Authorization": "Bearer " + SUPABASE_ANON_KEY,
+                     "Content-Type": "application/json"},
+            timeout=15.0,
+        )
+        rows = r.json() if r.status_code == 200 else []
+    except Exception:
+        rows = []
+    d = {}
+    for row in rows or []:
+        t = (row.get("term") or "").strip()
+        c = clean_md(row.get("content") or "").strip()
+        if t and c:
+            d[t] = {"body": c[:140], "src": (row.get("law_name") or "").strip()[:36]}
+    if d:
+        _DEFS = d
+        _DEF_TERMS = sorted(d.keys(), key=len, reverse=True)
+
+
 async def fast_law_lookup(client, term: str):
     # fast_law_card RPC(SECURITY DEFINER) 호출 — RLS 우회, 랭킹은 SQL에서. 임베딩/LLM 없이 1건.
     try:
@@ -379,29 +411,22 @@ async def stt(ws: WebSocket):
                 pass
 
     async def fetch_fast_cards(latest: str, at_iso: str):
-        # 빠른 레인: 용어 매칭 → firehelper_law 직접검색 → 즉시 기준 카드(안경+앱). LLM 없음.
+        # 빠른 레인: 화재안전기준 '정의' 매칭 → 즉시 용어 카드. 정의는 맥락 무관하게 항상 맞음. LLM 없음.
         if client is None:
             return
+        await load_defs(client)
+        if not _DEF_TERMS:
+            return
         shown = _FAST_SHOWN.setdefault(sid, set())
-        hits = [t for t in FAST_TERMS if t in latest and t not in shown][:2]
+        hits = [t for t in _DEF_TERMS if t in latest and t not in shown][:2]
         if not hits:
             return
         for term in hits:
-            shown.add(term)
-            row = await fast_law_lookup(client, term)
-            if not row:
+            d = _DEFS.get(term)
+            if not d:
                 continue
-            ln = (row.get("law_name") or "").strip()
-            atitle = (row.get("article_title") or "").strip()
-            title = (atitle or ln or term)[:24]
-            body = clean_md(row.get("content") or "")[:220]
-            src = ""
-            m = re.search(r"근거\s*[:：]\s*([^\n]+)", row.get("content") or "")
-            if m:
-                src = m.group(1).strip()[:40]
-            elif ln:
-                src = (ln + (" 제" + str(row.get("article_no")) + "조" if row.get("article_no") else ""))[:40]
-            card = {"type": "law", "title": title, "body": body, "src": src}
+            shown.add(term)
+            card = {"type": "concept", "title": term[:22], "body": d["body"], "src": d["src"]}
             st["cues"].append({**card, "at": at_iso, "anchor": at_iso})
             try:
                 await ws.send_json({"card": card})
@@ -485,7 +510,7 @@ async def stt(ws: WebSocket):
                     else:
                         core = "".join(ch for ch in latest if ch.isalnum())
                         if CUE_ON and ai_on and len(core) >= 4:
-                            if secs is None or "기준" in secs:
+                            if secs is None or "용어" in secs:
                                 asyncio.create_task(fetch_fast_cards(latest, at_iso))
                             asyncio.create_task(fetch_cue(latest, at_iso))
                     if client is not None:
