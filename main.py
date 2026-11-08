@@ -61,7 +61,7 @@ _FAST_SHOWN: dict = {}   # sid -> set(term)  세션당 같은 용어 재발 방�
 
 _DEFS: dict = {}          # term -> {"body","src"}  화재안전기준 '정의' 전체
 _DEF_TERMS: list = []     # 매칭용(긴 용어 우선)
-_DEF_ASK = re.compile(r"(뭐|뭔|무슨|무엇|뭣|정의|뜻|설명|모르|헷갈|처음|아세요|아시|알아|[?？])")   # 이 신호가 있을 때만 정의 카드
+_DEF_ASK = re.compile(r"(뜻|정의|뭐|뭔|무슨|무엇|뭣|설명해|설명 좀|모르|헷갈|처음 들|들어봤|아세요|아시나)")   # '정의를 묻는' 신호가 있을 때만(단순 물음표 제외)
 _DEFS_LOADED = False
 
 async def load_defs(client):
@@ -513,9 +513,7 @@ async def stt(ws: WebSocket):
                     else:
                         core = "".join(ch for ch in latest if ch.isalnum())
                         if CUE_ON and ai_on and len(core) >= 4:
-                            if secs is None or "용어" in secs:
-                                asyncio.create_task(fetch_fast_cards(latest, at_iso))
-                            asyncio.create_task(fetch_cue(latest, at_iso))
+                            asyncio.create_task(fetch_cue(latest, at_iso))   # 전부 맥락 AI(빠른 레인 비활성)
                     if client is not None:
                         last_save["t"] = time.time()
                         asyncio.create_task(save_session(client, sid, st, False))
