@@ -479,7 +479,7 @@ async def stt(ws: WebSocket):
                     else:
                         core = "".join(ch for ch in latest if ch.isalnum())
                         if CUE_ON and len(core) >= 4:
-                            await fetch_fast_cards(latest, at_iso)
+                            asyncio.create_task(fetch_fast_cards(latest, at_iso))
                             asyncio.create_task(fetch_cue(latest, at_iso))
                     if client is not None:
                         last_save["t"] = time.time()
@@ -550,9 +550,10 @@ async def stt(ws: WebSocket):
                             await ws.send_json({"text": text, "final": is_final})
                         except Exception:
                             pass
+                        if text:
+                            last_seg["t"] = time.time()   # 발화끝: interim 포함 리셋(말하는 중 안 끊김)
                         if is_final:
                             utter.append(text)
-                            last_seg["t"] = time.time()
                         if speech_final and not ask_next["v"]:
                             await flush_utter()
                     except Exception:
