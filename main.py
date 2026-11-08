@@ -37,7 +37,7 @@ SAVE_EVERY = 12  # DB 주기 저장 최소 간격(초)
 
 DG_URL = (
     "wss://api.deepgram.com/v1/listen"
-    "?model=nova-2&language=ko&encoding=linear16&sample_rate=16000&channels=1"
+    "?model=nova-3&language=ko&encoding=linear16&sample_rate=16000&channels=1"
     "&interim_results=true&punctuate=true&smart_format=true&endpointing=300"
 )
 
@@ -61,6 +61,7 @@ _FAST_SHOWN: dict = {}   # sid -> set(term)  세션당 같은 용어 재발 방�
 
 _DEFS: dict = {}          # term -> {"body","src"}  화재안전기준 '정의' 전체
 _DEF_TERMS: list = []     # 매칭용(긴 용어 우선)
+_DEF_ASK = re.compile(r"(뭐|뭔|무슨|무엇|뭣|정의|뜻|설명|모르|헷갈|처음|아세요|아시|알아|[?？])")   # 이 신호가 있을 때만 정의 카드
 _DEFS_LOADED = False
 
 async def load_defs(client):
@@ -85,7 +86,7 @@ async def load_defs(client):
         t = (row.get("term") or "").strip()
         c = clean_md(row.get("content") or "").strip()
         if t and c:
-            d[t] = {"body": c[:140], "src": (row.get("law_name") or "").strip()[:36]}
+            d[t] = {"body": c[:180], "src": (row.get("law_name") or "").strip()[:36]}
     if d:
         _DEFS = d
         _DEF_TERMS = sorted(d.keys(), key=len, reverse=True)
@@ -416,6 +417,8 @@ async def stt(ws: WebSocket):
             return
         await load_defs(client)
         if not _DEF_TERMS:
+            return
+        if not _DEF_ASK.search(latest):   # 용어가 나와도 '물어볼 때/헷갈릴 때'만 정의 표시
             return
         shown = _FAST_SHOWN.setdefault(sid, set())
         hits = [t for t in _DEF_TERMS if t in latest and t not in shown][:2]
