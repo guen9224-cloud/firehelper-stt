@@ -41,6 +41,7 @@ DG_URL = (
     "&interim_results=true&punctuate=true&smart_format=true&endpointing=300"
 )
 
+TYPE_SEC = {"concept": "용어", "law": "기준", "todo": "할일", "todo_add": "할일", "site": "현장"}
 FAST_TERMS = [
     "작동점검","종합점검","정밀점검","자체점검","외관점검","결과보고서","점검표",
     "감지기","차동식","정온식","연기감지기","불꽃감지기","아날로그감지기",
@@ -264,6 +265,9 @@ async def stt(ws: WebSocket):
     sid = norm_sid(ws.query_params.get("sid")) or uuid.uuid4().hex
     st = SESSIONS.setdefault(sid, {"lines": [], "cues": []})
     st["uid"] = await resolve_uid(ws.query_params.get("token"))   # 페어링 토큰 → 사용자
+    ai_on = ws.query_params.get("ai", "1") != "0"                    # AI 힌트 on/off
+    _secraw = ws.query_params.get("sec")
+    secs = set(x for x in (_secraw or "").split(",") if x) if _secraw is not None else None   # 섹션 필터(None=전체)
     PRODUCERS[sid] = ws   # AI 답변을 이 안경으로 푸시
     utter = []
     last_seg = {"t": 0.0}
@@ -345,6 +349,8 @@ async def stt(ws: WebSocket):
             for c in cues:
                 if not c:
                     continue
+                if secs is not None and c.get("type") != "answer" and TYPE_SEC.get(c.get("type"), "사내자료") not in secs:
+                    continue   # 섹션 필터
                 db_card = {
                     "type": c.get("type"), "title": c.get("title", ""),
                     "body": c.get("body", ""), "src": c.get("src", ""),
@@ -478,8 +484,9 @@ async def stt(ws: WebSocket):
                         asyncio.create_task(fetch_ai_answer(latest))   # 서버가 직접 AI 호출(카드 없이)
                     else:
                         core = "".join(ch for ch in latest if ch.isalnum())
-                        if CUE_ON and len(core) >= 4:
-                            asyncio.create_task(fetch_fast_cards(latest, at_iso))
+                        if CUE_ON and ai_on and len(core) >= 4:
+                            if secs is None or "기준" in secs:
+                                asyncio.create_task(fetch_fast_cards(latest, at_iso))
                             asyncio.create_task(fetch_cue(latest, at_iso))
                     if client is not None:
                         last_save["t"] = time.time()
