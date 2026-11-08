@@ -41,6 +41,43 @@ DG_URL = (
     "&interim_results=true&punctuate=true&smart_format=true&endpointing=300"
 )
 
+FAST_TERMS = [
+    "작동점검","종합점검","정밀점검","자체점검","외관점검","결과보고서","점검표",
+    "감지기","차동식","정온식","연기감지기","불꽃감지기","아날로그감지기",
+    "수신기","발신기","중계기","경계구역",
+    "스프링클러","프리액션밸브","준비작동식","알람밸브","유수검지장치","습식","건식","일제살수식","드렌처",
+    "소화기","분말소화기","옥내소화전","옥외소화전","호스릴",
+    "유도등","유도표지","비상조명등","휴대용비상조명등",
+    "피난기구","완강기","구조대","피난사다리","간이완강기",
+    "자동화재탐지설비","비상방송설비","비상경보설비","시각경보기","가스누설경보기",
+    "가스계소화설비","이산화탄소소화설비","할론","할로겐화합물","청정소화약제",
+    "제연설비","배연창","방화문","방화셔터","방화댐퍼","내화구조","방화구획",
+    "소화수조","저수조","연결송수관설비","연결살수설비","비상콘센트설비","무선통신보조설비",
+    "소방안전관리자","소방안전관리대상물","특정소방대상물","방염",
+    "위험물","제조소","옥내저장소","옥외탱크저장소","지정수량","과태료","조치명령",
+]
+_FAST_SHOWN: dict = {}   # sid -> set(term)  세션당 같은 용어 재발 방지
+
+async def fast_law_lookup(client, term: str):
+    # fast_law_card RPC(SECURITY DEFINER) 호출 — RLS 우회, 랭킹은 SQL에서. 임베딩/LLM 없이 1건.
+    try:
+        r = await client.post(
+            SUPABASE_URL + "/rest/v1/rpc/fast_law_card",
+            json={"q": term},
+            headers={"apikey": SUPABASE_ANON_KEY, "Authorization": "Bearer " + SUPABASE_ANON_KEY,
+                     "Content-Type": "application/json"},
+            timeout=6.0,
+        )
+        rows = r.json() if r.status_code == 200 else []
+    except Exception:
+        return None
+    if isinstance(rows, list) and rows:
+        return rows[0]
+    if isinstance(rows, dict) and rows:
+        return rows
+    return None
+
+
 SESSIONS: dict = {}   # sid -> {"lines":[{t,at}], "cues":[...], "uid": <사용자>}
 VIEWERS: dict = {}    # sid -> set[WebSocket]  (앱 실시간 뷰어들)
 PRODUCERS: dict = {}  # sid -> WebSocket (안경 producer; AI 답변을 안경으로 푸시)
@@ -335,6 +372,37 @@ async def stt(ws: WebSocket):
             except Exception:
                 pass
 
+    async def fetch_fast_cards(latest: str, at_iso: str):
+        # 빠른 레인: 용어 매칭 → firehelper_law 직접검색 → 즉시 기준 카드(안경+앱). LLM 없음.
+        if client is None:
+            return
+        shown = _FAST_SHOWN.setdefault(sid, set())
+        hits = [t for t in FAST_TERMS if t in latest and t not in shown][:2]
+        if not hits:
+            return
+        for term in hits:
+            shown.add(term)
+            row = await fast_law_lookup(client, term)
+            if not row:
+                continue
+            ln = (row.get("law_name") or "").strip()
+            atitle = (row.get("article_title") or "").strip()
+            title = (atitle or ln or term)[:24]
+            body = clean_md(row.get("content") or "")[:220]
+            src = ""
+            m = re.search(r"근거\s*[:：]\s*([^\n]+)", row.get("content") or "")
+            if m:
+                src = m.group(1).strip()[:40]
+            elif ln:
+                src = (ln + (" 제" + str(row.get("article_no")) + "조" if row.get("article_no") else ""))[:40]
+            card = {"type": "law", "title": title, "body": body, "src": src}
+            st["cues"].append({**card, "at": at_iso, "anchor": at_iso})
+            try:
+                await ws.send_json({"card": card})
+            except Exception:
+                pass
+            await broadcast(sid, {"card": card})
+
     async def fetch_todos():
         # 안경 '할일목록' 뷰 요청(TODOS) → conversate로 미완료 할 일 조회 → 안경에 내려줌
         if not CUE_ON or client is None:
@@ -411,6 +479,7 @@ async def stt(ws: WebSocket):
                     else:
                         core = "".join(ch for ch in latest if ch.isalnum())
                         if CUE_ON and len(core) >= 4:
+                            await fetch_fast_cards(latest, at_iso)
                             asyncio.create_task(fetch_cue(latest, at_iso))
                     if client is not None:
                         last_save["t"] = time.time()
