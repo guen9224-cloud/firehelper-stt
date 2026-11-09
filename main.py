@@ -27,6 +27,7 @@ OWNER_UID = os.environ.get("OWNER_UID", "")
 CARD_FREQ = os.environ.get("CARD_FREQ", "normal")
 CONV_URL = (SUPABASE_URL + "/functions/v1/conversate") if SUPABASE_URL else ""
 AI_URL = os.environ.get("AI_URL") or ((SUPABASE_URL + "/functions/v1/firehelper-ai") if SUPABASE_URL else "")
+AI_ALLOW_FALLBACK = os.environ.get("AI_ALLOW_FALLBACK", "0") == "1"   # 1이면 PC 미연결 시 API 폴백, 0이면 "PC 확인" 안내
 CUE_ON = bool(CONV_URL and GLASSES_TOKEN and OWNER_UID)
 CONV_HEADERS = {
     "Content-Type": "application/json",
@@ -465,13 +466,21 @@ async def stt(ws: WebSocket):
         asyncio.create_task(save_session(client, sid, st, False, force=True))
 
     async def fetch_ai_answer(question: str):
-        # 안경 질문 → ① 페어링된 개인 AI 헬퍼(PC) 있으면 그쪽, ② 없거나 실패하면 firehelper-ai(API) 폴백.
+        # 안경 질문 → 개인 AI 헬퍼(PC)가 연결돼 있으면 그쪽. 없으면 (기본) "PC 연결 확인" 안내.
         if not CUE_ON or client is None:
             return
         uid = st.get("uid") or OWNER_UID
         answer = ""
-        # ① 개인 AI 헬퍼(아웃바운드 WS)
         hws = HELPERS.get(uid)
+        # 개인 AI(PC) 미연결 → 기본은 API 폴백 대신 안내 카드. (AI_ALLOW_FALLBACK=1 이면 폴백)
+        if hws is None and not (AI_ALLOW_FALLBACK and AI_URL):
+            try:
+                await ws.send_json({"card": {"type": "answer", "title": "개인 AI 미연결",
+                    "body": "이 PC(개인 AI)가 연결되지 않았어요. PC가 켜져 있고 FireHelper AI가 실행 중인지 확인하세요.", "src": ""}})
+            except Exception:
+                pass
+            return
+        # ① 개인 AI 헬퍼(아웃바운드 WS)
         if hws is not None:
             try:
                 rid = uuid.uuid4().hex
@@ -483,9 +492,9 @@ async def stt(ws: WebSocket):
                 finally:
                     HELPER_PENDING.pop(rid, None)
             except Exception:
-                answer = ""   # 헬퍼 실패 → 폴백으로
-        # ② firehelper-ai(API) 폴백
-        if not answer and AI_URL:
+                answer = ""
+        # ② (옵션) API 폴백 — AI_ALLOW_FALLBACK=1 일 때만
+        if not answer and AI_ALLOW_FALLBACK and AI_URL:
             try:
                 r = await client.post(AI_URL, headers=CONV_HEADERS, json={
                     "message": question, "uid": uid,
