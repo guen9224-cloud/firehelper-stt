@@ -25,8 +25,8 @@ GLASSES_TOKEN = os.environ.get("GLASSES_TOKEN", "")
 OWNER_UID = os.environ.get("OWNER_UID", "")
 CARD_FREQ = os.environ.get("CARD_FREQ", "normal")
 CONV_URL = (SUPABASE_URL + "/functions/v1/conversate") if SUPABASE_URL else ""
-AI_URL = os.environ.get("AI_URL") or ((SUPABASE_URL + "/functions/v1/firehelper-ai") if SUPABASE_URL else "")CUE_ON = bool(CONV_URL and GLASSES_TOKEN and OWNER_UID)
-CONV_HEADERS = {
+AI_URL = os.environ.get("AI_URL") or ((SUPABASE_URL + "/functions/v1/firehelper-ai") if SUPABASE_URL else "")
+CUE_ON = bool(CONV_URL and GLASSES_TOKEN and OWNER_UID)CONV_HEADERS = {
     "Content-Type": "application/json",
     "Authorization": "Bearer " + SUPABASE_ANON_KEY,
     "apikey": SUPABASE_ANON_KEY,
