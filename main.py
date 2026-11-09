@@ -12,7 +12,6 @@ import os, json, asyncio, time, uuid, re
 from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 import websockets
 import httpx
 
@@ -26,8 +25,7 @@ GLASSES_TOKEN = os.environ.get("GLASSES_TOKEN", "")
 OWNER_UID = os.environ.get("OWNER_UID", "")
 CARD_FREQ = os.environ.get("CARD_FREQ", "normal")
 CONV_URL = (SUPABASE_URL + "/functions/v1/conversate") if SUPABASE_URL else ""
-AI_URL = os.environ.get("AI_URL") or ((SUPABASE_URL + "/functions/v1/firehelper-ai") if SUPABASE_URL else "")
-AI_ALLOW_FALLBACK = os.environ.get("AI_ALLOW_FALLBACK", "0") == "1"   # 1이면 PC 미연결 시 API 폴백, 0이면 "PC 확인" 안내
+AI_URL = (SUPABASE_URL + "/functions/v1/firehelper-ai") if SUPABASE_URL else ""
 CUE_ON = bool(CONV_URL and GLASSES_TOKEN and OWNER_UID)
 CONV_HEADERS = {
     "Content-Type": "application/json",
@@ -37,21 +35,10 @@ CONV_HEADERS = {
 }
 SAVE_EVERY = 12  # DB 주기 저장 최소 간격(초)
 
-import urllib.parse as _up
-# Deepgram nova-3 키텀 부스팅: 소방 핵심 용어를 미리 알려 오인식(예: 소화기→수화기) 감소
-DG_KEYTERMS = [
-    "소화기","수신기","발신기","감지기","중계기","경계구역","스프링클러","프리액션밸브",
-    "준비작동식","알람밸브","유수검지장치","옥내소화전","옥외소화전","유도등","비상조명등",
-    "자동화재탐지설비","제연설비","방화문","방화셔터","방화댐퍼","방화구획","소화수조",
-    "연결송수관설비","비상콘센트설비","무선통신보조설비","소방안전관리자","특정소방대상물",
-    "작동점검","종합점검","자체점검","차동식","정온식","연기감지기","불꽃감지기",
-    "완강기","피난기구","가스계소화설비","이산화탄소소화설비","할로겐화합물","제어반","템퍼스위치",
-]
 DG_URL = (
     "wss://api.deepgram.com/v1/listen"
-    "?model=nova-3&language=ko&encoding=linear16&sample_rate=16000&channels=1"
+    "?model=nova-2&language=ko&encoding=linear16&sample_rate=16000&channels=1"
     "&interim_results=true&punctuate=true&smart_format=true&endpointing=300"
-    + "".join("&keyterm=" + _up.quote(t) for t in DG_KEYTERMS)
 )
 
 TYPE_SEC = {"concept": "용어", "law": "기준", "todo": "할일", "todo_add": "할일", "site": "현장"}
@@ -74,11 +61,10 @@ _FAST_SHOWN: dict = {}   # sid -> set(term)  세션당 같은 용어 재발 방�
 
 _DEFS: dict = {}          # term -> {"body","src"}  화재안전기준 '정의' 전체
 _DEF_TERMS: list = []     # 매칭용(긴 용어 우선)
-_DEF_ASK = re.compile(r"(뜻|정의|뭐|뭔|무슨|무엇|뭣|설명해|설명 좀|모르|헷갈|처음 들|들어봤|아세요|아시나)")   # '정의를 묻는' 신호가 있을 때만(단순 물음표 제외)
 _DEFS_LOADED = False
 
 async def load_defs(client):
-    # 화재안전기준 '정의' 전체를 1회 로드(fast_defs RPC) → 메모리 매칭. 정의는 맥락 무관하게 항상 맞음.
+    # 화재안전기준 '정의' 전체를 1회 로드(fast_defs RPC) → 메모리 매칭(빠름, 맥락 무관하게 항상 맞음)
     global _DEFS, _DEF_TERMS, _DEFS_LOADED
     if _DEFS_LOADED:
         return
@@ -99,7 +85,7 @@ async def load_defs(client):
         t = (row.get("term") or "").strip()
         c = clean_md(row.get("content") or "").strip()
         if t and c:
-            d[t] = {"body": c[:180], "src": (row.get("law_name") or "").strip()[:36]}
+            d[t] = {"body": c[:140], "src": (row.get("law_name") or "").strip()[:36]}
     if d:
         _DEFS = d
         _DEF_TERMS = sorted(d.keys(), key=len, reverse=True)
@@ -126,8 +112,6 @@ async def fast_law_lookup(client, term: str):
 
 
 SESSIONS: dict = {}   # sid -> {"lines":[{t,at}], "cues":[...], "uid": <사용자>}
-HELPERS: dict = {}        # uid -> 개인 AI 헬퍼 WebSocket (PC에서 아웃바운드 접속)
-HELPER_PENDING: dict = {} # req_id -> asyncio.Future(answer)
 VIEWERS: dict = {}    # sid -> set[WebSocket]  (앱 실시간 뷰어들)
 PRODUCERS: dict = {}  # sid -> WebSocket (안경 producer; AI 답변을 안경으로 푸시)
 TOKEN_UID: dict = {}  # device_token -> uid (페어링 캐시)
@@ -208,90 +192,6 @@ async def pair(req: Request):
             return r.json()
     except Exception as e:
         return {"error": str(e)[:120]}
-
-
-AI_PAIR_FN = (SUPABASE_URL + "/functions/v1/fh-ai-pair") if SUPABASE_URL else ""
-
-_AI_CONNECT_PAGE = """<!doctype html>
-<html lang="ko"><head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FireHelper 개인 AI 연결</title>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<style>
-  :root{color-scheme:dark}*{box-sizing:border-box}
-  body{margin:0;background:#0b0d10;color:#e8eaed;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Noto Sans KR',sans-serif}
-  .wrap{max-width:560px;margin:0 auto;padding:28px 18px 60px}
-  h1{font-size:20px;margin:0 0 4px}.sub{color:#8b909a;font-size:13px;margin:0 0 22px}
-  .card{background:#14171c;border:1px solid #232830;border-radius:14px;padding:18px;margin:14px 0}
-  label{display:block;font-size:12px;color:#9aa0aa;margin:10px 0 5px}
-  input{width:100%;padding:11px 12px;border-radius:9px;border:1px solid #2a2f38;background:#0f1216;color:#e8eaed;font-size:14px}
-  button{cursor:pointer;border:0;border-radius:10px;font-weight:700;font-size:14px;padding:12px 14px}
-  .primary{width:100%;background:linear-gradient(135deg,#ff5a52,#d32f2f);color:#fff}
-  .ghost{background:#20242b;color:#cfd3da;padding:7px 10px;font-size:12px;border:1px solid #2a2f38}
-  .muted{color:#8b909a;font-size:12px}
-  pre{background:#0f1216;border:1px solid #2a2f38;border-radius:10px;padding:12px;overflow-x:auto;font-size:12.5px;white-space:pre-wrap;word-break:break-all}
-  .row{display:flex;gap:8px;align-items:center;justify-content:space-between}
-  .tok{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:#cfd3da}
-  .hide{display:none}.ok{color:#7ee081}.err{color:#ff8a85;font-size:13px}
-</style></head>
-<body><div class="wrap">
-  <h1>개인 AI 연결</h1>
-  <p class="sub">이 PC의 구독 AI를 FireHelper 대화지원에 연결합니다. 로그인 후 "이 PC 연결"을 누르세요.</p>
-  <div id="login" class="card">
-    <p class="muted" style="margin:0 0 10px">기존 FireHelper 계정(이메일/비밀번호)으로 로그인하세요.</p>
-    <label>이메일</label><input id="email" type="email" autocomplete="username">
-    <label>비밀번호</label><input id="pw" type="password" autocomplete="current-password">
-    <button class="primary" style="margin-top:12px" onclick="emailLogin()">이메일로 로그인</button>
-    <p id="loginErr" class="err"></p>
-  </div>
-  <div id="app" class="card hide">
-    <div class="row"><span class="muted">로그인: <b id="who"></b></span><button class="ghost" onclick="logout()">로그아웃</button></div>
-    <label>이 PC 이름 (구분용)</label>
-    <input id="label" placeholder="예: 회사 데스크탑">
-    <button class="primary" style="margin-top:12px" onclick="issue()">이 PC 연결 (토큰 발급)</button>
-    <div id="result" class="hide" style="margin-top:14px">
-      <p class="ok">발급됨 — 이 PC 터미널(헬퍼 폴더)에서 아래를 실행하세요:</p>
-      <pre id="cmd"></pre>
-      <button class="ghost" onclick="copyCmd()">명령 복사</button>
-    </div>
-    <div style="margin-top:18px"><div class="muted" style="margin-bottom:8px">발급된 토큰</div><div id="tokens"></div></div>
-  </div>
-<script>
-const SB_URL="__SB_URL__", ANON="__ANON__", PAIR_FN="__PAIR_FN__";
-const $=(id)=>document.getElementById(id);
-function showErr(m){ var e=$("loginErr"); if(e) e.textContent=m; }
-let sb=null, session=null;
-try {
-  if(!window.supabase || !window.supabase.createClient) throw new Error("supabase-js 로드 실패 (window.supabase 없음)");
-  sb = window.supabase.createClient(SB_URL, ANON);
-} catch(e){ showErr("초기화 오류: "+e.message); }
-async function refresh(){
-  if(!sb) return;
-  try {
-    const {data}=await sb.auth.getSession(); session=data.session;
-    if(session){ $("login").classList.add("hide"); $("app").classList.remove("hide"); $("who").textContent=session.user.email||session.user.id.slice(0,8); loadTokens(); }
-    else { $("app").classList.add("hide"); $("login").classList.remove("hide"); }
-  } catch(e){ showErr("세션 확인 오류: "+e.message); }
-}
-if(sb) sb.auth.onAuthStateChange(()=>refresh());
-async function emailLogin(){ if(!sb){ showErr("로그인 모듈 미로드 — 새로고침/인터넷 확인"); return; } showErr(""); try { const {error}=await sb.auth.signInWithPassword({email:$("email").value.trim(),password:$("pw").value}); if(error) showErr(error.message); } catch(e){ showErr(e.message); } }
-async function logout(){ await sb.auth.signOut(); }
-async function api(action,extra){ const r=await fetch(PAIR_FN,{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+session.access_token},body:JSON.stringify(Object.assign({action},extra||{}))}); return r.json(); }
-async function issue(){ const d=await api("issue",{label:$("label").value.trim()}); if(d.error){ alert(d.error); return; } $("cmd").textContent=d.command; $("result").classList.remove("hide"); loadTokens(); }
-function copyCmd(){ navigator.clipboard.writeText($("cmd").textContent); }
-async function loadTokens(){ const d=await api("list"); const el=$("tokens"); el.innerHTML=""; (d.tokens||[]).forEach(function(t){ const div=document.createElement("div"); div.className="row"; div.style.padding="7px 0"; div.style.borderTop="1px solid #232830"; const used=t.last_used?("최근 "+new Date(t.last_used).toLocaleString('ko-KR')):"미사용"; div.innerHTML='<span class="tok">'+(t.revoked?'[폐기] ':'[활성] ')+(t.label||'(이름없음)')+' · '+used+'</span>'; if(!t.revoked){ const b=document.createElement("button"); b.className="ghost"; b.textContent="폐기"; b.onclick=async function(){await api("revoke",{token:t.token}); loadTokens();}; div.appendChild(b); } el.appendChild(div); }); }
-if(sb) refresh();
-</script>
-</div></body></html>"""
-
-
-@app.get("/ai-connect")
-def ai_connect():
-    html = (_AI_CONNECT_PAGE
-            .replace("__SB_URL__", SUPABASE_URL)
-            .replace("__ANON__", SUPABASE_ANON_KEY)
-            .replace("__PAIR_FN__", AI_PAIR_FN))
-    return HTMLResponse(content=html)
 
 
 async def save_session(client, sid, st, finalize, force=False):
@@ -386,59 +286,6 @@ async def view(ws: WebSocket):
 
 
 # ───────── 안경 플러그인(오디오 producer) ─────────
-async def resolve_helper_uid(token: str):
-    # per-user 페어링 토큰 -> uid (fh_ai_token_uid RPC). 무효/폐기면 None.
-    if not (token and SUPABASE_URL and SUPABASE_ANON_KEY):
-        return None
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as c:
-            r = await c.post(
-                SUPABASE_URL + "/rest/v1/rpc/fh_ai_token_uid",
-                headers={"apikey": SUPABASE_ANON_KEY, "Authorization": "Bearer " + SUPABASE_ANON_KEY, "Content-Type": "application/json"},
-                json={"p_token": token},
-            )
-        v = r.json()
-        return v if isinstance(v, str) and len(v) >= 20 else None
-    except Exception:
-        return None
-
-
-@app.websocket("/helper")
-async def helper_ws(ws: WebSocket):
-    # 직원 PC의 개인 AI 헬퍼가 아웃바운드로 접속. per-user 토큰 -> uid 인증(GLASSES_TOKEN 불필요).
-    token = ws.query_params.get("token", "")
-    uid = await resolve_helper_uid(token)
-    if not uid:
-        await ws.close(code=4401)
-        return
-    await ws.accept()
-    HELPERS[uid] = ws
-    try:
-        while True:
-            raw = await ws.receive_text()
-            try:
-                m = json.loads(raw)
-            except Exception:
-                continue
-            t = m.get("type")
-            if t in ("answer", "error"):
-                fut = HELPER_PENDING.get(m.get("id"))
-                if fut is not None and not fut.done():
-                    fut.set_result(m.get("text") if t == "answer" else "")
-            elif t == "ping":
-                try:
-                    await ws.send_text(json.dumps({"type": "pong"}))
-                except Exception:
-                    pass
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
-    finally:
-        if HELPERS.get(uid) is ws:
-            HELPERS.pop(uid, None)
-
-
 @app.websocket("/stt")
 async def stt(ws: WebSocket):
     await ws.accept()
@@ -466,81 +313,55 @@ async def stt(ws: WebSocket):
         asyncio.create_task(save_session(client, sid, st, False, force=True))
 
     async def fetch_ai_answer(question: str):
-        # 안경 질문 → 개인 AI 헬퍼(PC)가 연결돼 있으면 그쪽. 없으면 (기본) "PC 연결 확인" 안내.
-        if not CUE_ON or client is None:
+        # 안경 질문 → 서버가 firehelper-ai 직접 호출(앱 없이도 동작). SSE data:{delta} 누적.
+        if not CUE_ON or client is None or not AI_URL:
             return
-        uid = st.get("uid") or OWNER_UID
-        answer = ""
-        hws = HELPERS.get(uid)
-        # 개인 AI(PC) 미연결 → 기본은 API 폴백 대신 안내 카드. (AI_ALLOW_FALLBACK=1 이면 폴백)
-        if hws is None and not (AI_ALLOW_FALLBACK and AI_URL):
-            try:
-                await ws.send_json({"card": {"type": "answer", "title": "개인 AI 미연결",
-                    "body": "이 PC(개인 AI)가 연결되지 않았어요. PC가 켜져 있고 FireHelper AI가 실행 중인지 확인하세요.", "src": ""}})
-            except Exception:
-                pass
-            return
-        # ① 개인 AI 헬퍼(아웃바운드 WS)
-        if hws is not None:
-            try:
-                rid = uuid.uuid4().hex
-                fut = asyncio.get_event_loop().create_future()
-                HELPER_PENDING[rid] = fut
+        try:
+            r = await client.post(AI_URL, headers=CONV_HEADERS, json={
+                "message": question, "uid": st.get("uid") or OWNER_UID,
+            }, timeout=90.0)
+            txt = r.text
+            tt = txt.strip()
+            if tt.startswith("{"):
                 try:
-                    await hws.send_text(json.dumps({"type": "ask", "id": rid, "q": question}, ensure_ascii=False))
-                    answer = (await asyncio.wait_for(fut, timeout=90.0)) or ""
-                finally:
-                    HELPER_PENDING.pop(rid, None)
-            except Exception:
-                answer = ""
-        # ② (옵션) API 폴백 — AI_ALLOW_FALLBACK=1 일 때만
-        if not answer and AI_ALLOW_FALLBACK and AI_URL:
-            try:
-                r = await client.post(AI_URL, headers=CONV_HEADERS, json={
-                    "message": question, "uid": uid,
-                }, timeout=90.0)
-                txt = r.text
-                tt = txt.strip()
-                if tt.startswith("{"):
-                    try:
-                        o = json.loads(tt)
-                        if o.get("error"):
-                            await ws.send_json({"cue_err": "AI: " + str(o.get("error"))[:80]})
-                            return
-                    except Exception:
-                        pass
-                for block in txt.split("\n\n"):
-                    for line in block.split("\n"):
-                        if line.startswith("data:"):
-                            try:
-                                ev = json.loads(line[5:].strip())
-                            except Exception:
-                                continue
-                            dd = ev.get("delta")
-                            if isinstance(dd, str):
-                                answer += dd
-            except Exception as e:
+                    o = json.loads(tt)
+                    if o.get("error"):
+                        await ws.send_json({"cue_err": "AI: " + str(o.get("error"))[:80]})
+                        return
+                except Exception:
+                    pass
+            answer = ""
+            for block in txt.split("\n\n"):
+                for line in block.split("\n"):
+                    if line.startswith("data:"):
+                        try:
+                            ev = json.loads(line[5:].strip())
+                        except Exception:
+                            continue
+                        dd = ev.get("delta")
+                        if isinstance(dd, str):
+                            answer += dd
+            answer = answer.strip()
+            if not answer:
                 try:
-                    await ws.send_json({"cue_err": str(e)[:120]})
+                    await ws.send_json({"cue_err": "AI 답변 비어있음"})
                 except Exception:
                     pass
                 return
-        answer = (answer or "").strip()
-        if not answer:
+            at_iso = now_iso()
+            title = (question[:30] + "…") if len(question) > 30 else (question or "AI 답변")
+            st["cues"].append({"type": "answer", "title": title, "body": answer, "q": question, "src": "", "at": at_iso, "anchor": at_iso})
             try:
-                await ws.send_json({"cue_err": "AI 답변 비어있음"})
+                await ws.send_json({"card": {"type": "answer", "title": title, "body": clean_md(answer), "src": ""}})
             except Exception:
                 pass
-            return
-        at_iso = now_iso()
-        title = (question[:30] + "…") if len(question) > 30 else (question or "AI 답변")
-        st["cues"].append({"type": "answer", "title": title, "body": answer, "q": question, "src": "", "at": at_iso, "anchor": at_iso})
-        try:
-            await ws.send_json({"card": {"type": "answer", "title": title, "body": clean_md(answer), "src": ""}})
-        except Exception:
-            pass
-        await broadcast(sid, {"ai": {"q": question, "a": answer}})
-        await save_session(client, sid, st, False)
+            await broadcast(sid, {"ai": {"q": question, "a": answer}})
+            await save_session(client, sid, st, False)
+        except Exception as e:
+            try:
+                await ws.send_json({"cue_err": str(e)[:120]})
+            except Exception:
+                pass
 
     async def fetch_cue(latest: str, at_iso: str):
         if not CUE_ON or client is None:
@@ -596,8 +417,6 @@ async def stt(ws: WebSocket):
         await load_defs(client)
         if not _DEF_TERMS:
             return
-        if not _DEF_ASK.search(latest):   # 용어가 나와도 '물어볼 때/헷갈릴 때'만 정의 표시
-            return
         shown = _FAST_SHOWN.setdefault(sid, set())
         hits = [t for t in _DEF_TERMS if t in latest and t not in shown][:2]
         if not hits:
@@ -650,6 +469,22 @@ async def stt(ws: WebSocket):
             try: await ws.send_json({"sched": {"today": [], "next": []}, "sched_err": str(e)[:120]})
             except Exception: pass
 
+    async def fetch_notifs():
+        # 안경 '알림목록' 뷰 요청(NOTIFS) → conversate로 내 알림 조회 → 안경에 내려줌
+        if not CUE_ON or client is None:
+            try: await ws.send_json({"notifs": []})
+            except Exception: pass
+            return
+        try:
+            r = await client.post(CONV_URL, headers=CONV_HEADERS, json={
+                "action": "glasses_notifications", "uid": st.get("uid") or OWNER_UID,
+            })
+            d = r.json()
+            await ws.send_json({"notifs": d.get("notifs") or []})
+        except Exception as e:
+            try: await ws.send_json({"notifs": [], "notif_err": str(e)[:120]})
+            except Exception: pass
+
     try:
         async with websockets.connect(
             DG_URL,
@@ -691,7 +526,9 @@ async def stt(ws: WebSocket):
                     else:
                         core = "".join(ch for ch in latest if ch.isalnum())
                         if CUE_ON and ai_on and len(core) >= 4:
-                            asyncio.create_task(fetch_cue(latest, at_iso))   # 전부 맥락 AI(빠른 레인 비활성)
+                            if secs is None or "용어" in secs:
+                                asyncio.create_task(fetch_fast_cards(latest, at_iso))
+                            asyncio.create_task(fetch_cue(latest, at_iso))
                     if client is not None:
                         last_save["t"] = time.time()
                         asyncio.create_task(save_session(client, sid, st, False))
@@ -737,6 +574,9 @@ async def stt(ws: WebSocket):
                             elif tt == "SCHED":
                                 # 안경 일정 뷰 → 오늘·내일 일정 조회해 안경에 전달
                                 asyncio.create_task(fetch_schedule())
+                            elif tt == "NOTIFS":
+                                # 안경 알림목록 뷰 → 내 알림 조회해 안경에 전달
+                                asyncio.create_task(fetch_notifs())
                 except WebSocketDisconnect:
                     pass
                 finally:
