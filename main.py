@@ -124,6 +124,8 @@ async def fast_law_lookup(client, term: str):
 
 
 SESSIONS: dict = {}   # sid -> {"lines":[{t,at}], "cues":[...], "uid": <사용자>}
+HELPERS: dict = {}        # uid -> 개인 AI 헬퍼 WebSocket (PC에서 아웃바운드 접속)
+HELPER_PENDING: dict = {} # req_id -> asyncio.Future(answer)
 VIEWERS: dict = {}    # sid -> set[WebSocket]  (앱 실시간 뷰어들)
 PRODUCERS: dict = {}  # sid -> WebSocket (안경 producer; AI 답변을 안경으로 푸시)
 TOKEN_UID: dict = {}  # device_token -> uid (페어링 캐시)
@@ -298,6 +300,42 @@ async def view(ws: WebSocket):
 
 
 # ───────── 안경 플러그인(오디오 producer) ─────────
+@app.websocket("/helper")
+async def helper_ws(ws: WebSocket):
+    # 직원 PC의 개인 AI 헬퍼가 아웃바운드로 접속. uid 로 매핑, GLASSES_TOKEN 으로 인증.
+    uid = ws.query_params.get("uid", "")
+    token = ws.query_params.get("token", "")
+    if not uid or not GLASSES_TOKEN or token != GLASSES_TOKEN:
+        await ws.close(code=4401)
+        return
+    await ws.accept()
+    HELPERS[uid] = ws
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                m = json.loads(raw)
+            except Exception:
+                continue
+            t = m.get("type")
+            if t in ("answer", "error"):
+                fut = HELPER_PENDING.get(m.get("id"))
+                if fut is not None and not fut.done():
+                    fut.set_result(m.get("text") if t == "answer" else "")
+            elif t == "ping":
+                try:
+                    await ws.send_text(json.dumps({"type": "pong"}))
+                except Exception:
+                    pass
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        if HELPERS.get(uid) is ws:
+            HELPERS.pop(uid, None)
+
+
 @app.websocket("/stt")
 async def stt(ws: WebSocket):
     await ws.accept()
@@ -325,55 +363,73 @@ async def stt(ws: WebSocket):
         asyncio.create_task(save_session(client, sid, st, False, force=True))
 
     async def fetch_ai_answer(question: str):
-        # 안경 질문 → 서버가 firehelper-ai 직접 호출(앱 없이도 동작). SSE data:{delta} 누적.
-        if not CUE_ON or client is None or not AI_URL:
+        # 안경 질문 → ① 페어링된 개인 AI 헬퍼(PC) 있으면 그쪽, ② 없거나 실패하면 firehelper-ai(API) 폴백.
+        if not CUE_ON or client is None:
             return
-        try:
-            r = await client.post(AI_URL, headers=CONV_HEADERS, json={
-                "message": question, "uid": st.get("uid") or OWNER_UID,
-            }, timeout=90.0)
-            txt = r.text
-            tt = txt.strip()
-            if tt.startswith("{"):
+        uid = st.get("uid") or OWNER_UID
+        answer = ""
+        # ① 개인 AI 헬퍼(아웃바운드 WS)
+        hws = HELPERS.get(uid)
+        if hws is not None:
+            try:
+                rid = uuid.uuid4().hex
+                fut = asyncio.get_event_loop().create_future()
+                HELPER_PENDING[rid] = fut
                 try:
-                    o = json.loads(tt)
-                    if o.get("error"):
-                        await ws.send_json({"cue_err": "AI: " + str(o.get("error"))[:80]})
-                        return
-                except Exception:
-                    pass
-            answer = ""
-            for block in txt.split("\n\n"):
-                for line in block.split("\n"):
-                    if line.startswith("data:"):
-                        try:
-                            ev = json.loads(line[5:].strip())
-                        except Exception:
-                            continue
-                        dd = ev.get("delta")
-                        if isinstance(dd, str):
-                            answer += dd
-            answer = answer.strip()
-            if not answer:
+                    await hws.send_text(json.dumps({"type": "ask", "id": rid, "q": question}, ensure_ascii=False))
+                    answer = (await asyncio.wait_for(fut, timeout=90.0)) or ""
+                finally:
+                    HELPER_PENDING.pop(rid, None)
+            except Exception:
+                answer = ""   # 헬퍼 실패 → 폴백으로
+        # ② firehelper-ai(API) 폴백
+        if not answer and AI_URL:
+            try:
+                r = await client.post(AI_URL, headers=CONV_HEADERS, json={
+                    "message": question, "uid": uid,
+                }, timeout=90.0)
+                txt = r.text
+                tt = txt.strip()
+                if tt.startswith("{"):
+                    try:
+                        o = json.loads(tt)
+                        if o.get("error"):
+                            await ws.send_json({"cue_err": "AI: " + str(o.get("error"))[:80]})
+                            return
+                    except Exception:
+                        pass
+                for block in txt.split("\n\n"):
+                    for line in block.split("\n"):
+                        if line.startswith("data:"):
+                            try:
+                                ev = json.loads(line[5:].strip())
+                            except Exception:
+                                continue
+                            dd = ev.get("delta")
+                            if isinstance(dd, str):
+                                answer += dd
+            except Exception as e:
                 try:
-                    await ws.send_json({"cue_err": "AI 답변 비어있음"})
+                    await ws.send_json({"cue_err": str(e)[:120]})
                 except Exception:
                     pass
                 return
-            at_iso = now_iso()
-            title = (question[:30] + "…") if len(question) > 30 else (question or "AI 답변")
-            st["cues"].append({"type": "answer", "title": title, "body": answer, "q": question, "src": "", "at": at_iso, "anchor": at_iso})
+        answer = (answer or "").strip()
+        if not answer:
             try:
-                await ws.send_json({"card": {"type": "answer", "title": title, "body": clean_md(answer), "src": ""}})
+                await ws.send_json({"cue_err": "AI 답변 비어있음"})
             except Exception:
                 pass
-            await broadcast(sid, {"ai": {"q": question, "a": answer}})
-            await save_session(client, sid, st, False)
-        except Exception as e:
-            try:
-                await ws.send_json({"cue_err": str(e)[:120]})
-            except Exception:
-                pass
+            return
+        at_iso = now_iso()
+        title = (question[:30] + "…") if len(question) > 30 else (question or "AI 답변")
+        st["cues"].append({"type": "answer", "title": title, "body": answer, "q": question, "src": "", "at": at_iso, "anchor": at_iso})
+        try:
+            await ws.send_json({"card": {"type": "answer", "title": title, "body": clean_md(answer), "src": ""}})
+        except Exception:
+            pass
+        await broadcast(sid, {"ai": {"q": question, "a": answer}})
+        await save_session(client, sid, st, False)
 
     async def fetch_cue(latest: str, at_iso: str):
         if not CUE_ON or client is None:
