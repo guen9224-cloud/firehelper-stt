@@ -215,7 +215,7 @@ _AI_CONNECT_PAGE = """<!doctype html>
 <html lang="ko"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FireHelper 개인 AI 연결</title>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.4/dist/umd/supabase.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style>
   :root{color-scheme:dark}*{box-sizing:border-box}
   body{margin:0;background:#0b0d10;color:#e8eaed;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Noto Sans KR',sans-serif}
@@ -236,7 +236,7 @@ _AI_CONNECT_PAGE = """<!doctype html>
 <body><div class="wrap">
   <h1>개인 AI 연결</h1>
   <p class="sub">이 PC의 구독 AI를 FireHelper 대화지원에 연결합니다. 로그인 후 "이 PC 연결"을 누르세요.</p>
-  <div id="login" class="card hide">
+  <div id="login" class="card">
     <p class="muted" style="margin:0 0 10px">기존 FireHelper 계정(이메일/비밀번호)으로 로그인하세요.</p>
     <label>이메일</label><input id="email" type="email" autocomplete="username">
     <label>비밀번호</label><input id="pw" type="password" autocomplete="current-password">
@@ -257,22 +257,29 @@ _AI_CONNECT_PAGE = """<!doctype html>
   </div>
 <script>
 const SB_URL="__SB_URL__", ANON="__ANON__", PAIR_FN="__PAIR_FN__";
-const sb=window.supabase.createClient(SB_URL,ANON);
 const $=(id)=>document.getElementById(id);
-let session=null;
+function showErr(m){ var e=$("loginErr"); if(e) e.textContent=m; }
+let sb=null, session=null;
+try {
+  if(!window.supabase || !window.supabase.createClient) throw new Error("supabase-js 로드 실패 (window.supabase 없음)");
+  sb = window.supabase.createClient(SB_URL, ANON);
+} catch(e){ showErr("초기화 오류: "+e.message); }
 async function refresh(){
-  const {data}=await sb.auth.getSession(); session=data.session;
-  if(session){ $("login").classList.add("hide"); $("app").classList.remove("hide"); $("who").textContent=session.user.email||session.user.id.slice(0,8); loadTokens(); }
-  else { $("app").classList.add("hide"); $("login").classList.remove("hide"); }
+  if(!sb) return;
+  try {
+    const {data}=await sb.auth.getSession(); session=data.session;
+    if(session){ $("login").classList.add("hide"); $("app").classList.remove("hide"); $("who").textContent=session.user.email||session.user.id.slice(0,8); loadTokens(); }
+    else { $("app").classList.add("hide"); $("login").classList.remove("hide"); }
+  } catch(e){ showErr("세션 확인 오류: "+e.message); }
 }
-sb.auth.onAuthStateChange(()=>refresh());
-async function emailLogin(){ $("loginErr").textContent=""; const {error}=await sb.auth.signInWithPassword({email:$("email").value.trim(),password:$("pw").value}); if(error) $("loginErr").textContent=error.message; }
+if(sb) sb.auth.onAuthStateChange(()=>refresh());
+async function emailLogin(){ if(!sb){ showErr("로그인 모듈 미로드 — 새로고침/인터넷 확인"); return; } showErr(""); try { const {error}=await sb.auth.signInWithPassword({email:$("email").value.trim(),password:$("pw").value}); if(error) showErr(error.message); } catch(e){ showErr(e.message); } }
 async function logout(){ await sb.auth.signOut(); }
 async function api(action,extra){ const r=await fetch(PAIR_FN,{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+session.access_token},body:JSON.stringify(Object.assign({action},extra||{}))}); return r.json(); }
 async function issue(){ const d=await api("issue",{label:$("label").value.trim()}); if(d.error){ alert(d.error); return; } $("cmd").textContent=d.command; $("result").classList.remove("hide"); loadTokens(); }
 function copyCmd(){ navigator.clipboard.writeText($("cmd").textContent); }
 async function loadTokens(){ const d=await api("list"); const el=$("tokens"); el.innerHTML=""; (d.tokens||[]).forEach(function(t){ const div=document.createElement("div"); div.className="row"; div.style.padding="7px 0"; div.style.borderTop="1px solid #232830"; const used=t.last_used?("최근 "+new Date(t.last_used).toLocaleString('ko-KR')):"미사용"; div.innerHTML='<span class="tok">'+(t.revoked?'[폐기] ':'[활성] ')+(t.label||'(이름없음)')+' · '+used+'</span>'; if(!t.revoked){ const b=document.createElement("button"); b.className="ghost"; b.textContent="폐기"; b.onclick=async function(){await api("revoke",{token:t.token}); loadTokens();}; div.appendChild(b); } el.appendChild(div); }); }
-refresh();
+if(sb) refresh();
 </script>
 </div></body></html>"""
 
