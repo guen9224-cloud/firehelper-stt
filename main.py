@@ -300,12 +300,29 @@ async def view(ws: WebSocket):
 
 
 # ───────── 안경 플러그인(오디오 producer) ─────────
+async def resolve_helper_uid(token: str):
+    # per-user 페어링 토큰 -> uid (fh_ai_token_uid RPC). 무효/폐기면 None.
+    if not (token and SUPABASE_URL and SUPABASE_ANON_KEY):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            r = await c.post(
+                SUPABASE_URL + "/rest/v1/rpc/fh_ai_token_uid",
+                headers={"apikey": SUPABASE_ANON_KEY, "Authorization": "Bearer " + SUPABASE_ANON_KEY, "Content-Type": "application/json"},
+                json={"p_token": token},
+            )
+        v = r.json()
+        return v if isinstance(v, str) and len(v) >= 20 else None
+    except Exception:
+        return None
+
+
 @app.websocket("/helper")
 async def helper_ws(ws: WebSocket):
-    # 직원 PC의 개인 AI 헬퍼가 아웃바운드로 접속. uid 로 매핑, GLASSES_TOKEN 으로 인증.
-    uid = ws.query_params.get("uid", "")
+    # 직원 PC의 개인 AI 헬퍼가 아웃바운드로 접속. per-user 토큰 -> uid 인증(GLASSES_TOKEN 불필요).
     token = ws.query_params.get("token", "")
-    if not uid or not GLASSES_TOKEN or token != GLASSES_TOKEN:
+    uid = await resolve_helper_uid(token)
+    if not uid:
         await ws.close(code=4401)
         return
     await ws.accept()
