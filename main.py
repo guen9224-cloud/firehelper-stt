@@ -12,6 +12,7 @@ import os, json, asyncio, time, uuid, re
 from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 import websockets
 import httpx
 
@@ -206,6 +207,83 @@ async def pair(req: Request):
             return r.json()
     except Exception as e:
         return {"error": str(e)[:120]}
+
+
+AI_PAIR_FN = (SUPABASE_URL + "/functions/v1/fh-ai-pair") if SUPABASE_URL else ""
+
+_AI_CONNECT_PAGE = """<!doctype html>
+<html lang="ko"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FireHelper 개인 AI 연결</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.4/dist/umd/supabase.js"></script>
+<style>
+  :root{color-scheme:dark}*{box-sizing:border-box}
+  body{margin:0;background:#0b0d10;color:#e8eaed;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Noto Sans KR',sans-serif}
+  .wrap{max-width:560px;margin:0 auto;padding:28px 18px 60px}
+  h1{font-size:20px;margin:0 0 4px}.sub{color:#8b909a;font-size:13px;margin:0 0 22px}
+  .card{background:#14171c;border:1px solid #232830;border-radius:14px;padding:18px;margin:14px 0}
+  label{display:block;font-size:12px;color:#9aa0aa;margin:10px 0 5px}
+  input{width:100%;padding:11px 12px;border-radius:9px;border:1px solid #2a2f38;background:#0f1216;color:#e8eaed;font-size:14px}
+  button{cursor:pointer;border:0;border-radius:10px;font-weight:700;font-size:14px;padding:12px 14px}
+  .primary{width:100%;background:linear-gradient(135deg,#ff5a52,#d32f2f);color:#fff}
+  .ghost{background:#20242b;color:#cfd3da;padding:7px 10px;font-size:12px;border:1px solid #2a2f38}
+  .muted{color:#8b909a;font-size:12px}
+  pre{background:#0f1216;border:1px solid #2a2f38;border-radius:10px;padding:12px;overflow-x:auto;font-size:12.5px;white-space:pre-wrap;word-break:break-all}
+  .row{display:flex;gap:8px;align-items:center;justify-content:space-between}
+  .tok{font-family:ui-monospace,Menlo,monospace;font-size:12px;color:#cfd3da}
+  .hide{display:none}.ok{color:#7ee081}.err{color:#ff8a85;font-size:13px}
+</style></head>
+<body><div class="wrap">
+  <h1>개인 AI 연결</h1>
+  <p class="sub">이 PC의 구독 AI를 FireHelper 대화지원에 연결합니다. 로그인 후 "이 PC 연결"을 누르세요.</p>
+  <div id="login" class="card hide">
+    <p class="muted" style="margin:0 0 10px">기존 FireHelper 계정(이메일/비밀번호)으로 로그인하세요.</p>
+    <label>이메일</label><input id="email" type="email" autocomplete="username">
+    <label>비밀번호</label><input id="pw" type="password" autocomplete="current-password">
+    <button class="primary" style="margin-top:12px" onclick="emailLogin()">이메일로 로그인</button>
+    <p id="loginErr" class="err"></p>
+  </div>
+  <div id="app" class="card hide">
+    <div class="row"><span class="muted">로그인: <b id="who"></b></span><button class="ghost" onclick="logout()">로그아웃</button></div>
+    <label>이 PC 이름 (구분용)</label>
+    <input id="label" placeholder="예: 회사 데스크탑">
+    <button class="primary" style="margin-top:12px" onclick="issue()">이 PC 연결 (토큰 발급)</button>
+    <div id="result" class="hide" style="margin-top:14px">
+      <p class="ok">발급됨 — 이 PC 터미널(헬퍼 폴더)에서 아래를 실행하세요:</p>
+      <pre id="cmd"></pre>
+      <button class="ghost" onclick="copyCmd()">명령 복사</button>
+    </div>
+    <div style="margin-top:18px"><div class="muted" style="margin-bottom:8px">발급된 토큰</div><div id="tokens"></div></div>
+  </div>
+<script>
+const SB_URL="__SB_URL__", ANON="__ANON__", PAIR_FN="__PAIR_FN__";
+const sb=window.supabase.createClient(SB_URL,ANON);
+const $=(id)=>document.getElementById(id);
+let session=null;
+async function refresh(){
+  const {data}=await sb.auth.getSession(); session=data.session;
+  if(session){ $("login").classList.add("hide"); $("app").classList.remove("hide"); $("who").textContent=session.user.email||session.user.id.slice(0,8); loadTokens(); }
+  else { $("app").classList.add("hide"); $("login").classList.remove("hide"); }
+}
+sb.auth.onAuthStateChange(()=>refresh());
+async function emailLogin(){ $("loginErr").textContent=""; const {error}=await sb.auth.signInWithPassword({email:$("email").value.trim(),password:$("pw").value}); if(error) $("loginErr").textContent=error.message; }
+async function logout(){ await sb.auth.signOut(); }
+async function api(action,extra){ const r=await fetch(PAIR_FN,{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+session.access_token},body:JSON.stringify(Object.assign({action},extra||{}))}); return r.json(); }
+async function issue(){ const d=await api("issue",{label:$("label").value.trim()}); if(d.error){ alert(d.error); return; } $("cmd").textContent=d.command; $("result").classList.remove("hide"); loadTokens(); }
+function copyCmd(){ navigator.clipboard.writeText($("cmd").textContent); }
+async function loadTokens(){ const d=await api("list"); const el=$("tokens"); el.innerHTML=""; (d.tokens||[]).forEach(function(t){ const div=document.createElement("div"); div.className="row"; div.style.padding="7px 0"; div.style.borderTop="1px solid #232830"; const used=t.last_used?("최근 "+new Date(t.last_used).toLocaleString('ko-KR')):"미사용"; div.innerHTML='<span class="tok">'+(t.revoked?'[폐기] ':'[활성] ')+(t.label||'(이름없음)')+' · '+used+'</span>'; if(!t.revoked){ const b=document.createElement("button"); b.className="ghost"; b.textContent="폐기"; b.onclick=async function(){await api("revoke",{token:t.token}); loadTokens();}; div.appendChild(b); } el.appendChild(div); }); }
+refresh();
+</script>
+</div></body></html>"""
+
+
+@app.get("/ai-connect")
+def ai_connect():
+    html = (_AI_CONNECT_PAGE
+            .replace("__SB_URL__", SUPABASE_URL)
+            .replace("__ANON__", SUPABASE_ANON_KEY)
+            .replace("__PAIR_FN__", AI_PAIR_FN))
+    return HTMLResponse(content=html)
 
 
 async def save_session(client, sid, st, finalize, force=False):
