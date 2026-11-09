@@ -35,10 +35,21 @@ CONV_HEADERS = {
 }
 SAVE_EVERY = 12  # DB 주기 저장 최소 간격(초)
 
+import urllib.parse as _up
+# Deepgram nova-3 키텀 부스팅: 소방 핵심 용어를 미리 알려 오인식(예: 소화기→수화기) 감소
+DG_KEYTERMS = [
+    "소화기","수신기","발신기","감지기","중계기","경계구역","스프링클러","프리액션밸브",
+    "준비작동식","알람밸브","유수검지장치","옥내소화전","옥외소화전","유도등","비상조명등",
+    "자동화재탐지설비","제연설비","방화문","방화셔터","방화댐퍼","방화구획","소화수조",
+    "연결송수관설비","비상콘센트설비","무선통신보조설비","소방안전관리자","특정소방대상물",
+    "작동점검","종합점검","자체점검","차동식","정온식","연기감지기","불꽃감지기",
+    "완강기","피난기구","가스계소화설비","이산화탄소소화설비","할로겐화합물","제어반","템퍼스위치",
+]
 DG_URL = (
     "wss://api.deepgram.com/v1/listen"
     "?model=nova-3&language=ko&encoding=linear16&sample_rate=16000&channels=1"
     "&interim_results=true&punctuate=true&smart_format=true&endpointing=300"
+    + "".join("&keyterm=" + _up.quote(t) for t in DG_KEYTERMS)
 )
 
 TYPE_SEC = {"concept": "용어", "law": "기준", "todo": "할일", "todo_add": "할일", "site": "현장"}
