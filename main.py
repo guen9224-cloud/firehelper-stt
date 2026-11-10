@@ -128,6 +128,7 @@ async def fast_law_lookup(client, term: str):
 SESSIONS: dict = {}   # sid -> {"lines":[{t,at}], "cues":[...], "uid": <사용자>}
 HELPERS: dict = {}        # uid -> 개인 AI 헬퍼 WebSocket (PC에서 아웃바운드 접속)
 HELPER_PENDING: dict = {} # req_id -> asyncio.Future(answer)
+HELPER_DELTA: dict = {}   # req_id -> async on_delta(chunk) — 스트리밍 부분답 전달
 VIEWERS: dict = {}    # sid -> set[WebSocket]  (앱 실시간 뷰어들)
 PRODUCERS: dict = {}  # sid -> WebSocket (안경 producer; AI 답변을 안경으로 푸시)
 TOKEN_UID: dict = {}  # device_token -> uid (페어링 캐시)
@@ -421,7 +422,11 @@ async def helper_ws(ws: WebSocket):
             except Exception:
                 continue
             t = m.get("type")
-            if t in ("answer", "error"):
+            if t == "answer_delta":
+                cb = HELPER_DELTA.get(m.get("id"))
+                if cb is not None:
+                    asyncio.create_task(cb(m.get("text") or ""))
+            elif t in ("answer", "error"):
                 fut = HELPER_PENDING.get(m.get("id"))
                 if fut is not None and not fut.done():
                     fut.set_result(m.get("text") if t == "answer" else "")
@@ -471,6 +476,21 @@ async def stt(ws: WebSocket):
             return
         uid = st.get("uid") or OWNER_UID
         answer = ""
+        rid = uuid.uuid4().hex
+        title = (question[:30] + "…") if len(question) > 30 else (question or "AI 답변")
+        _acc = {"t": ""}
+        _lastm = {"t": 0.0}
+        async def _on_delta(chunk: str):
+            _acc["t"] += (chunk or "")
+            import time as _tm
+            nowm = _tm.monotonic()
+            if nowm - _lastm["t"] < 0.18:   # 과도한 갱신 방지(≈0.18초 간격)
+                return
+            _lastm["t"] = nowm
+            try:
+                await ws.send_json({"card": {"type": "answer", "id": rid, "title": title, "body": clean_md(_acc["t"]), "partial": True, "src": ""}})
+            except Exception:
+                pass
         hws = HELPERS.get(uid)
         # 개인 AI(PC) 미연결 → 기본은 API 폴백 대신 안내 카드. (AI_ALLOW_FALLBACK=1 이면 폴백)
         if hws is None and not (AI_ALLOW_FALLBACK and AI_URL):
@@ -483,14 +503,15 @@ async def stt(ws: WebSocket):
         # ① 개인 AI 헬퍼(아웃바운드 WS)
         if hws is not None:
             try:
-                rid = uuid.uuid4().hex
                 fut = asyncio.get_event_loop().create_future()
                 HELPER_PENDING[rid] = fut
+                HELPER_DELTA[rid] = _on_delta
                 try:
                     await hws.send_text(json.dumps({"type": "ask", "id": rid, "q": question + "\n\n(반드시 한국어로, 핵심만 2~4문장 간결하게.)"}, ensure_ascii=False))
                     answer = (await asyncio.wait_for(fut, timeout=90.0)) or ""
                 finally:
                     HELPER_PENDING.pop(rid, None)
+                    HELPER_DELTA.pop(rid, None)
             except Exception:
                 answer = ""
         # ② (옵션) API 폴백 — AI_ALLOW_FALLBACK=1 일 때만
@@ -533,10 +554,9 @@ async def stt(ws: WebSocket):
                 pass
             return
         at_iso = now_iso()
-        title = (question[:30] + "…") if len(question) > 30 else (question or "AI 답변")
         st["cues"].append({"type": "answer", "title": title, "body": answer, "q": question, "src": "", "at": at_iso, "anchor": at_iso})
         try:
-            await ws.send_json({"card": {"type": "answer", "title": title, "body": clean_md(answer), "src": ""}})
+            await ws.send_json({"card": {"type": "answer", "id": rid, "title": title, "body": clean_md(answer), "src": ""}})
         except Exception:
             pass
         await broadcast(sid, {"ai": {"q": question, "a": answer}})
