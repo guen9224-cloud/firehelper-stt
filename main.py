@@ -650,6 +650,22 @@ async def stt(ws: WebSocket):
             try: await ws.send_json({"sched": {"today": [], "next": []}, "sched_err": str(e)[:120]})
             except Exception: pass
 
+    async def fetch_notifs():
+        # 안경 '알림목록' 뷰 요청(NOTIFS) → conversate로 내 알림 조회 → 안경에 내려줌
+        if not CUE_ON or client is None:
+            try: await ws.send_json({"notifs": []})
+            except Exception: pass
+            return
+        try:
+            r = await client.post(CONV_URL, headers=CONV_HEADERS, json={
+                "action": "glasses_notifications", "uid": st.get("uid") or OWNER_UID,
+            })
+            d = r.json()
+            await ws.send_json({"notifs": d.get("notifs") or []})
+        except Exception as e:
+            try: await ws.send_json({"notifs": [], "notif_err": str(e)[:120]})
+            except Exception: pass
+
     try:
         async with websockets.connect(
             DG_URL,
@@ -737,6 +753,9 @@ async def stt(ws: WebSocket):
                             elif tt == "SCHED":
                                 # 안경 일정 뷰 → 오늘·내일 일정 조회해 안경에 전달
                                 asyncio.create_task(fetch_schedule())
+                            elif tt == "NOTIFS":
+                                # 안경 알림목록 뷰 → 내 알림 조회해 안경에 전달
+                                asyncio.create_task(fetch_notifs())
                 except WebSocketDisconnect:
                     pass
                 finally:
