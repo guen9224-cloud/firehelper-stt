@@ -129,6 +129,7 @@ SESSIONS: dict = {}   # sid -> {"lines":[{t,at}], "cues":[...], "uid": <사용�
 HELPERS: dict = {}        # uid -> 개인 AI 헬퍼 WebSocket (PC에서 아웃바운드 접속)
 HELPER_PENDING: dict = {} # req_id -> asyncio.Future(answer)
 HELPER_DELTA: dict = {}   # req_id -> async on_delta(chunk) — 스트리밍 부분답 전달
+REQ_SID: dict = {}        # req_id -> sid  (헬퍼의 뒤이은 say[브리핑 음성]를 해당 세션 뷰어에게 전달)
 VIEWERS: dict = {}    # sid -> set[WebSocket]  (앱 실시간 뷰어들)
 PRODUCERS: dict = {}  # sid -> WebSocket (안경 producer; AI 답변을 안경으로 푸시)
 TOKEN_UID: dict = {}  # device_token -> uid (페어링 캐시)
@@ -430,6 +431,11 @@ async def helper_ws(ws: WebSocket):
                 fut = HELPER_PENDING.get(m.get("id"))
                 if fut is not None and not fut.done():
                     fut.set_result(m.get("text") if t == "answer" else "")
+            elif t == "say":
+                # 브리핑 음성: 카드(answer) 뒤이어 오는 자연 문장 → 해당 세션 앱(뷰어)에 전달
+                _sid = REQ_SID.get(m.get("id"))
+                if _sid:
+                    asyncio.create_task(broadcast(_sid, {"say": {"id": m.get("id"), "text": m.get("text") or ""}}))
             elif t == "ping":
                 try:
                     await ws.send_text(json.dumps({"type": "pong"}))
@@ -477,6 +483,10 @@ async def stt(ws: WebSocket):
         uid = st.get("uid") or OWNER_UID
         answer = ""
         rid = uuid.uuid4().hex
+        REQ_SID[rid] = sid   # 브리핑 등 뒤이은 say(음성)를 이 세션 뷰어에게 라우팅
+        async def _drop_reqsid(_r=rid):
+            await asyncio.sleep(25); REQ_SID.pop(_r, None)
+        asyncio.create_task(_drop_reqsid())
         title = (question[:30] + "…") if len(question) > 30 else (question or "AI 답변")
         _acc = {"t": ""}
         _lastm = {"t": 0.0}
