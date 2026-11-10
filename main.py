@@ -114,6 +114,8 @@ async def fast_law_lookup(client, term: str):
 SESSIONS: dict = {}   # sid -> {"lines":[{t,at}], "cues":[...], "uid": <사용자>}
 VIEWERS: dict = {}    # sid -> set[WebSocket]  (앱 실시간 뷰어들)
 PRODUCERS: dict = {}  # sid -> WebSocket (안경 producer; AI 답변을 안경으로 푸시)
+HELPERS: dict = {}      # uid -> WebSocket (회사 PC 개인 AI 헬퍼; 구독 claude -p)
+HELPER_WAIT: dict = {}  # rid -> asyncio.Future (헬퍼 답변 대기)
 TOKEN_UID: dict = {}  # device_token -> uid (페어링 캐시)
 
 
@@ -192,6 +194,86 @@ async def pair(req: Request):
             return r.json()
     except Exception as e:
         return {"error": str(e)[:120]}
+
+
+async def ask_helper(uid: str, question: str, timeout: float = 180.0):
+    # 안경 질문 → 회사 PC 개인 AI 헬퍼(구독 claude -p)로 전달하고 답변을 기다린다. (API 폴백 없음)
+    ws = HELPERS.get(uid)
+    if ws is None and len(HELPERS) == 1:
+        ws = next(iter(HELPERS.values()))   # 회사 PC 1대: uid 안 맞아도 연결된 헬퍼가 하나면 사용
+    if ws is None:
+        return None, "offline"
+    rid = uuid.uuid4().hex
+    fut = asyncio.get_running_loop().create_future()
+    HELPER_WAIT[rid] = fut
+    try:
+        await ws.send_json({"type": "ask", "id": rid, "q": question})
+    except Exception:
+        HELPER_WAIT.pop(rid, None)
+        return None, "offline"
+    try:
+        return await asyncio.wait_for(fut, timeout=timeout)
+    except asyncio.TimeoutError:
+        return None, "timeout"
+    finally:
+        HELPER_WAIT.pop(rid, None)
+
+
+# ───────── 회사 PC 개인 AI 헬퍼(구독 claude -p) 아웃바운드 연결 ─────────
+@app.websocket("/helper")
+async def helper(ws: WebSocket):
+    await ws.accept()
+    token = (ws.query_params.get("token") or "").strip()
+    if not token:
+        try: await ws.send_json({"type": "error", "msg": "no token"})
+        except Exception: pass
+        await ws.close(); return
+    uid = await resolve_uid(token)
+    HELPERS[uid] = ws   # 이 PC 헬퍼를 사용자에 매핑(안경 질문이 여기로 감)
+
+    async def ping_helper():
+        try:
+            while True:
+                await asyncio.sleep(25)
+                try:
+                    await ws.send_json({"type": "ping"})
+                except Exception:
+                    break
+        except asyncio.CancelledError:
+            pass
+    pk = asyncio.create_task(ping_helper())
+    try:
+        while True:
+            m = await ws.receive()
+            if m.get("type") == "websocket.disconnect":
+                break
+            t = m.get("text")
+            if not t:
+                continue
+            try:
+                d = json.loads(t)
+            except Exception:
+                continue
+            mt = d.get("type")
+            if mt == "answer":
+                fut = HELPER_WAIT.get(d.get("id"))
+                if fut is not None and not fut.done():
+                    fut.set_result((str(d.get("text") or "").strip(), None))
+            elif mt == "error":
+                fut = HELPER_WAIT.get(d.get("id"))
+                if fut is not None and not fut.done():
+                    fut.set_result((None, str(d.get("msg") or "error")[:120]))
+            # hello / pong 은 무시(연결 유지용)
+    except Exception:
+        pass
+    finally:
+        pk.cancel()
+        if HELPERS.get(uid) is ws:
+            HELPERS.pop(uid, None)
+        try:
+            await ws.close()
+        except Exception:
+            pass
 
 
 async def save_session(client, sid, st, finalize, force=False):
@@ -313,55 +395,40 @@ async def stt(ws: WebSocket):
         asyncio.create_task(save_session(client, sid, st, False, force=True))
 
     async def fetch_ai_answer(question: str):
-        # 안경 질문 → 서버가 firehelper-ai 직접 호출(앱 없이도 동작). SSE data:{delta} 누적.
-        if not CUE_ON or client is None or not AI_URL:
+        # 안경 질문 → 회사 PC 개인 AI 헬퍼(구독 claude -p)로만 답한다. API 폴백 없음.
+        uid = st.get("uid") or OWNER_UID
+        # 구독 claude -p 는 기본 영어로 답하므로, 한국어+간결 지시를 붙여 보냄
+        ask_q = question + "\n\n(반드시 한국어로 답해줘. 안경 화면에 바로 표시되니 핵심만 2~4문장으로 간결하게.)"
+        answer, emsg = await ask_helper(uid, ask_q, timeout=180.0)
+        if not answer:
+            # 회사 PC 헬퍼가 꺼져있거나 끊김 → 폴백 없이 안내만
+            if emsg == "timeout":
+                note = "회사 PC 헬퍼 응답이 지연되고 있어요. 잠시 후 다시 물어봐 주세요."
+            elif emsg == "offline":
+                note = "회사 PC 헬퍼와 연결이 끊어졌어요. 회사 컴퓨터에서 헬퍼가 켜져 있는지 확인해 주세요."
+            else:
+                note = "회사 PC 헬퍼 오류: " + str(emsg)[:80]
+            try:
+                await ws.send_json({"card": {"type": "answer", "title": "연결 끊김", "body": note, "src": ""}})
+            except Exception:
+                pass
+            try:
+                await ws.send_json({"cue_err": note})
+            except Exception:
+                pass
+            await broadcast(sid, {"ai": {"q": question, "a": "⚠️ " + note}})
             return
+        at_iso = now_iso()
+        title = (question[:30] + "…") if len(question) > 30 else (question or "AI 답변")
+        st["cues"].append({"type": "answer", "title": title, "body": answer, "q": question, "src": "", "at": at_iso, "anchor": at_iso})
         try:
-            r = await client.post(AI_URL, headers=CONV_HEADERS, json={
-                "message": question, "uid": st.get("uid") or OWNER_UID,
-            }, timeout=90.0)
-            txt = r.text
-            tt = txt.strip()
-            if tt.startswith("{"):
-                try:
-                    o = json.loads(tt)
-                    if o.get("error"):
-                        await ws.send_json({"cue_err": "AI: " + str(o.get("error"))[:80]})
-                        return
-                except Exception:
-                    pass
-            answer = ""
-            for block in txt.split("\n\n"):
-                for line in block.split("\n"):
-                    if line.startswith("data:"):
-                        try:
-                            ev = json.loads(line[5:].strip())
-                        except Exception:
-                            continue
-                        dd = ev.get("delta")
-                        if isinstance(dd, str):
-                            answer += dd
-            answer = answer.strip()
-            if not answer:
-                try:
-                    await ws.send_json({"cue_err": "AI 답변 비어있음"})
-                except Exception:
-                    pass
-                return
-            at_iso = now_iso()
-            title = (question[:30] + "…") if len(question) > 30 else (question or "AI 답변")
-            st["cues"].append({"type": "answer", "title": title, "body": answer, "q": question, "src": "", "at": at_iso, "anchor": at_iso})
-            try:
-                await ws.send_json({"card": {"type": "answer", "title": title, "body": clean_md(answer), "src": ""}})
-            except Exception:
-                pass
-            await broadcast(sid, {"ai": {"q": question, "a": answer}})
+            await ws.send_json({"card": {"type": "answer", "title": title, "body": clean_md(answer), "src": ""}})
+        except Exception:
+            pass
+        await broadcast(sid, {"ai": {"q": question, "a": answer}})
+        if client is not None:
             await save_session(client, sid, st, False)
-        except Exception as e:
-            try:
-                await ws.send_json({"cue_err": str(e)[:120]})
-            except Exception:
-                pass
+
 
     async def fetch_cue(latest: str, at_iso: str):
         if not CUE_ON or client is None:
