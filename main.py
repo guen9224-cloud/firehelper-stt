@@ -338,6 +338,7 @@ async def ask_endpoint(req: Request):
     q = str(body.get("q") or body.get("message") or "").strip()
     conv = body.get("conversation_id")
     site = body.get("site_id")
+    helper_only = bool(body.get("helper_only"))   # True면 헬퍼만(폴백 금지) — firehelper-ai 재귀 방지
     auth = req.headers.get("authorization") or req.headers.get("Authorization") or ""
     token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
     if not q:
@@ -363,7 +364,7 @@ async def ask_endpoint(req: Request):
         finally:
             HELPER_PENDING.pop(rid, None)
     # 2) 폴백 -> firehelper-ai (사용자 토큰 그대로 전달 -> 대화기록/권한 보존)
-    if not answer and AI_URL:
+    if not answer and not helper_only and AI_URL:
         try:
             async with httpx.AsyncClient(timeout=90.0) as c:
                 r = await c.post(AI_URL,
