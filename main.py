@@ -313,6 +313,81 @@ async def save_session(client, sid, st, finalize, force=False):
 
 
 # ───────── 앱 실시간 뷰어 ─────────
+async def _uid_from_jwt(token: str) -> str:
+    # 앱 사용자의 Supabase access_token(JWT) -> uid (검증). 무효면 "".
+    if not (token and SUPABASE_URL and SUPABASE_ANON_KEY):
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            r = await c.get(SUPABASE_URL + "/auth/v1/user",
+                            headers={"apikey": SUPABASE_ANON_KEY, "Authorization": "Bearer " + token})
+        if r.status_code == 200:
+            return str((r.json() or {}).get("id") or "")
+    except Exception:
+        return ""
+    return ""
+
+
+@app.post("/ask")
+async def ask_endpoint(req: Request):
+    # 앱(안경대화 질문칸/음성 어시스턴트/대화지원)의 질문 -> PC 헬퍼(구독) 우선, 없으면 firehelper-ai 폴백.
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    q = str(body.get("q") or body.get("message") or "").strip()
+    conv = body.get("conversation_id")
+    site = body.get("site_id")
+    auth = req.headers.get("authorization") or req.headers.get("Authorization") or ""
+    token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
+    if not q:
+        return {"answer": "", "error": "empty"}
+    uid = await _uid_from_jwt(token)
+    if not uid:
+        return {"answer": "", "error": "no_auth", "conversation_id": conv}
+    answer = ""
+    via = ""
+    # 1) PC 헬퍼(구독 클로드 + MCP). 연결된 사용자만.
+    hws = HELPERS.get(uid)
+    if hws is not None:
+        rid = uuid.uuid4().hex
+        fut = asyncio.get_event_loop().create_future()
+        HELPER_PENDING[rid] = fut
+        try:
+            await hws.send_text(json.dumps({"type": "ask", "id": rid, "q": q}, ensure_ascii=False))
+            answer = (await asyncio.wait_for(fut, timeout=90.0)) or ""
+            if answer:
+                via = "helper"
+        except Exception:
+            answer = ""
+        finally:
+            HELPER_PENDING.pop(rid, None)
+    # 2) 폴백 -> firehelper-ai (사용자 토큰 그대로 전달 -> 대화기록/권한 보존)
+    if not answer and AI_URL:
+        try:
+            async with httpx.AsyncClient(timeout=90.0) as c:
+                r = await c.post(AI_URL,
+                    headers={"Content-Type": "application/json", "apikey": SUPABASE_ANON_KEY, "Authorization": "Bearer " + token},
+                    json={"message": q, "conversation_id": conv, "site_id": site})
+            txt = r.text
+            for blk in txt.split("\n\n"):
+                for line in blk.split("\n"):
+                    if line.startswith("data:"):
+                        try:
+                            ev = json.loads(line[5:].strip())
+                        except Exception:
+                            continue
+                        if ev.get("conversation_id") and not conv:
+                            conv = ev.get("conversation_id")
+                        dd = ev.get("delta")
+                        if isinstance(dd, str):
+                            answer += dd
+            via = "api"
+        except Exception:
+            pass
+    return {"answer": (answer or "").strip(), "conversation_id": conv, "via": via}
+
+
 @app.websocket("/view")
 async def view(ws: WebSocket):
     await ws.accept()
