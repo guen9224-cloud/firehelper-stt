@@ -128,8 +128,7 @@ async def fast_law_lookup(client, term: str):
 SESSIONS: dict = {}   # sid -> {"lines":[{t,at}], "cues":[...], "uid": <사용자>}
 HELPERS: dict = {}        # uid -> 개인 AI 헬퍼 WebSocket (PC에서 아웃바운드 접속)
 HELPER_PENDING: dict = {} # req_id -> asyncio.Future(answer)
-HELPER_DELTA: dict = {}   # req_id -> async on_delta(chunk) — 스트리밍 부분답 전달
-REQ_SID: dict = {}        # req_id -> sid  (헬퍼의 뒤이은 say[브리핑 음성]를 해당 세션 뷰어에게 전달)
+REQ_SID: dict = {}        # req_id -> sid (헬퍼의 뒤이은 say[브리핑 음성]를 해당 세션 뷰어에게 전달)
 VIEWERS: dict = {}    # sid -> set[WebSocket]  (앱 실시간 뷰어들)
 PRODUCERS: dict = {}  # sid -> WebSocket (안경 producer; AI 답변을 안경으로 푸시)
 TOKEN_UID: dict = {}  # device_token -> uid (페어링 캐시)
@@ -313,82 +312,6 @@ async def save_session(client, sid, st, finalize, force=False):
 
 
 # ───────── 앱 실시간 뷰어 ─────────
-async def _uid_from_jwt(token: str) -> str:
-    # 앱 사용자의 Supabase access_token(JWT) -> uid (검증). 무효면 "".
-    if not (token and SUPABASE_URL and SUPABASE_ANON_KEY):
-        return ""
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as c:
-            r = await c.get(SUPABASE_URL + "/auth/v1/user",
-                            headers={"apikey": SUPABASE_ANON_KEY, "Authorization": "Bearer " + token})
-        if r.status_code == 200:
-            return str((r.json() or {}).get("id") or "")
-    except Exception:
-        return ""
-    return ""
-
-
-@app.post("/ask")
-async def ask_endpoint(req: Request):
-    # 앱(안경대화 질문칸/음성 어시스턴트/대화지원)의 질문 -> PC 헬퍼(구독) 우선, 없으면 firehelper-ai 폴백.
-    try:
-        body = await req.json()
-    except Exception:
-        body = {}
-    q = str(body.get("q") or body.get("message") or "").strip()
-    conv = body.get("conversation_id")
-    site = body.get("site_id")
-    helper_only = bool(body.get("helper_only"))   # True면 헬퍼만(폴백 금지) — firehelper-ai 재귀 방지
-    auth = req.headers.get("authorization") or req.headers.get("Authorization") or ""
-    token = auth[7:].strip() if auth[:7].lower() == "bearer " else ""
-    if not q:
-        return {"answer": "", "error": "empty"}
-    uid = await _uid_from_jwt(token)
-    if not uid:
-        return {"answer": "", "error": "no_auth", "conversation_id": conv}
-    answer = ""
-    via = ""
-    # 1) PC 헬퍼(구독 클로드 + MCP). 연결된 사용자만.
-    hws = HELPERS.get(uid)
-    if hws is not None:
-        rid = uuid.uuid4().hex
-        fut = asyncio.get_event_loop().create_future()
-        HELPER_PENDING[rid] = fut
-        try:
-            await hws.send_text(json.dumps({"type": "ask", "id": rid, "q": q}, ensure_ascii=False))
-            answer = (await asyncio.wait_for(fut, timeout=90.0)) or ""
-            if answer:
-                via = "helper"
-        except Exception:
-            answer = ""
-        finally:
-            HELPER_PENDING.pop(rid, None)
-    # 2) 폴백 -> firehelper-ai (사용자 토큰 그대로 전달 -> 대화기록/권한 보존)
-    if not answer and not helper_only and AI_URL:
-        try:
-            async with httpx.AsyncClient(timeout=90.0) as c:
-                r = await c.post(AI_URL,
-                    headers={"Content-Type": "application/json", "apikey": SUPABASE_ANON_KEY, "Authorization": "Bearer " + token},
-                    json={"message": q, "conversation_id": conv, "site_id": site})
-            txt = r.text
-            for blk in txt.split("\n\n"):
-                for line in blk.split("\n"):
-                    if line.startswith("data:"):
-                        try:
-                            ev = json.loads(line[5:].strip())
-                        except Exception:
-                            continue
-                        if ev.get("conversation_id") and not conv:
-                            conv = ev.get("conversation_id")
-                        dd = ev.get("delta")
-                        if isinstance(dd, str):
-                            answer += dd
-            via = "api"
-        except Exception:
-            pass
-    return {"answer": (answer or "").strip(), "conversation_id": conv, "via": via}
-
-
 @app.websocket("/view")
 async def view(ws: WebSocket):
     await ws.accept()
@@ -499,16 +422,16 @@ async def helper_ws(ws: WebSocket):
             except Exception:
                 continue
             t = m.get("type")
-            if t == "answer_delta":
-                cb = HELPER_DELTA.get(m.get("id"))
-                if cb is not None:
-                    asyncio.create_task(cb(m.get("text") or ""))
-            elif t in ("answer", "error"):
+            if t in ("answer", "error"):
                 fut = HELPER_PENDING.get(m.get("id"))
                 if fut is not None and not fut.done():
                     fut.set_result(m.get("text") if t == "answer" else "")
+            elif t == "answer_full":
+                # 전체 마크다운 답(part2) → 앱 실시간보기(/view)로만 중계. 안경 하드웨어엔 보내지 않음(짧은 답 유지).
+                _sid = REQ_SID.get(m.get("id"))
+                if _sid:
+                    asyncio.create_task(broadcast(_sid, {"ai_full": {"id": m.get("id"), "text": m.get("text") or ""}}))
             elif t == "say":
-                # 브리핑 음성: 카드(answer) 뒤이어 오는 자연 문장 → 해당 세션 앱(뷰어)에 전달
                 _sid = REQ_SID.get(m.get("id"))
                 if _sid:
                     asyncio.create_task(broadcast(_sid, {"say": {"id": m.get("id"), "text": m.get("text") or ""}}))
@@ -558,25 +481,6 @@ async def stt(ws: WebSocket):
             return
         uid = st.get("uid") or OWNER_UID
         answer = ""
-        rid = uuid.uuid4().hex
-        REQ_SID[rid] = sid   # 브리핑 등 뒤이은 say(음성)를 이 세션 뷰어에게 라우팅
-        async def _drop_reqsid(_r=rid):
-            await asyncio.sleep(25); REQ_SID.pop(_r, None)
-        asyncio.create_task(_drop_reqsid())
-        title = (question[:30] + "…") if len(question) > 30 else (question or "AI 답변")
-        _acc = {"t": ""}
-        _lastm = {"t": 0.0}
-        async def _on_delta(chunk: str):
-            _acc["t"] += (chunk or "")
-            import time as _tm
-            nowm = _tm.monotonic()
-            if nowm - _lastm["t"] < 0.18:   # 과도한 갱신 방지(≈0.18초 간격)
-                return
-            _lastm["t"] = nowm
-            try:
-                await ws.send_json({"card": {"type": "answer", "id": rid, "title": title, "body": clean_md(_acc["t"]), "partial": True, "src": ""}})
-            except Exception:
-                pass
         hws = HELPERS.get(uid)
         # 개인 AI(PC) 미연결 → 기본은 API 폴백 대신 안내 카드. (AI_ALLOW_FALLBACK=1 이면 폴백)
         if hws is None and not (AI_ALLOW_FALLBACK and AI_URL):
@@ -589,15 +493,18 @@ async def stt(ws: WebSocket):
         # ① 개인 AI 헬퍼(아웃바운드 WS)
         if hws is not None:
             try:
+                rid = uuid.uuid4().hex
+                REQ_SID[rid] = sid
+                async def _drop_reqsid(_r=rid):
+                    await asyncio.sleep(200); REQ_SID.pop(_r, None)   # 전체답변(answer_full) 중계까지 rid→sid 유지
+                asyncio.create_task(_drop_reqsid())
                 fut = asyncio.get_event_loop().create_future()
                 HELPER_PENDING[rid] = fut
-                HELPER_DELTA[rid] = _on_delta
                 try:
                     await hws.send_text(json.dumps({"type": "ask", "id": rid, "q": question + "\n\n(반드시 한국어로, 핵심만 2~4문장 간결하게.)"}, ensure_ascii=False))
                     answer = (await asyncio.wait_for(fut, timeout=90.0)) or ""
                 finally:
                     HELPER_PENDING.pop(rid, None)
-                    HELPER_DELTA.pop(rid, None)
             except Exception:
                 answer = ""
         # ② (옵션) API 폴백 — AI_ALLOW_FALLBACK=1 일 때만
@@ -640,9 +547,10 @@ async def stt(ws: WebSocket):
                 pass
             return
         at_iso = now_iso()
+        title = (question[:30] + "…") if len(question) > 30 else (question or "AI 답변")
         st["cues"].append({"type": "answer", "title": title, "body": answer, "q": question, "src": "", "at": at_iso, "anchor": at_iso})
         try:
-            await ws.send_json({"card": {"type": "answer", "id": rid, "title": title, "body": clean_md(answer), "src": ""}})
+            await ws.send_json({"card": {"type": "answer", "title": title, "body": clean_md(answer), "src": ""}})
         except Exception:
             pass
         await broadcast(sid, {"ai": {"q": question, "a": answer}})
