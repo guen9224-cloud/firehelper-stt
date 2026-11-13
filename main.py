@@ -12,7 +12,7 @@ import os, json, asyncio, time, uuid, re
 from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 import websockets
 import httpx
 
@@ -132,6 +132,7 @@ REQ_SID: dict = {}        # req_id -> sid (헬퍼의 뒤이은 say[브리핑 음
 VIEWERS: dict = {}    # sid -> set[WebSocket]  (앱 실시간 뷰어들)
 PRODUCERS: dict = {}  # sid -> WebSocket (안경 producer; AI 답변을 안경으로 푸시)
 TOKEN_UID: dict = {}  # device_token -> uid (페어링 캐시)
+GLASSES_BY_UID: dict = {}  # uid -> sid (워치/폰 원격제어 ctrl 라우팅)
 
 
 def norm_sid(s) -> str:
@@ -312,6 +313,31 @@ async def save_session(client, sid, st, finalize, force=False):
 
 
 # ───────── 앱 실시간 뷰어 ─────────
+@app.post("/ctrl")
+async def ctrl(req: Request):
+    # 워치(또는 폰)가 안경을 원격 조작. body 또는 query: token(페어링 토큰), action
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    token = str(body.get("token") or req.query_params.get("token") or "")
+    action = str(body.get("action") or req.query_params.get("action") or "").strip()
+    if action not in ("ai", "select", "back", "up", "down", "exit"):
+        return JSONResponse({"ok": False, "error": "bad_action"}, status_code=400)
+    uid = await resolve_uid(token) if token else ""
+    if not uid:
+        return JSONResponse({"ok": False, "error": "auth"}, status_code=401)
+    sid = GLASSES_BY_UID.get(uid)
+    ws = PRODUCERS.get(sid) if sid else None
+    if ws is None:
+        return JSONResponse({"ok": False, "error": "no_glasses"}, status_code=409)   # 안경 세션 없음
+    try:
+        await ws.send_json({"ctrl": {"action": action}})
+    except Exception:
+        return JSONResponse({"ok": False, "error": "send_failed"}, status_code=502)
+    return JSONResponse({"ok": True, "action": action})
+
+
 @app.websocket("/view")
 async def view(ws: WebSocket):
     await ws.accept()
@@ -464,6 +490,8 @@ async def stt(ws: WebSocket):
     _secraw = ws.query_params.get("sec")
     secs = set(x for x in (_secraw or "").split(",") if x) if _secraw is not None else None   # 섹션 필터(None=전체)
     PRODUCERS[sid] = ws   # AI 답변을 이 안경으로 푸시
+    if st.get("uid"):
+        GLASSES_BY_UID[st["uid"]] = sid   # 워치 원격제어(ctrl) 라우팅
     utter = []
     last_seg = {"t": 0.0}
     end_requested = {"v": False}
@@ -832,6 +860,9 @@ async def stt(ws: WebSocket):
                 pass
         if PRODUCERS.get(sid) is ws:
             PRODUCERS.pop(sid, None)
+            _u = st.get("uid")
+            if _u and GLASSES_BY_UID.get(_u) == sid:
+                GLASSES_BY_UID.pop(_u, None)
         if end_requested["v"]:
             SESSIONS.pop(sid, None)
         try:
