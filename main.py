@@ -133,6 +133,7 @@ VIEWERS: dict = {}    # sid -> set[WebSocket]  (앱 실시간 뷰어들)
 PRODUCERS: dict = {}  # sid -> WebSocket (안경 producer; AI 답변을 안경으로 푸시)
 TOKEN_UID: dict = {}  # device_token -> uid (페어링 캐시)
 GLASSES_BY_UID: dict = {}  # uid -> sid (워치/폰 원격제어 ctrl 라우팅)
+WORK_PENDING: dict = {}  # uid -> ts (워치 '작업' 트리거: 다음 발화를 helper1 작업큐로 보냄)
 
 
 def norm_sid(s) -> str:
@@ -322,7 +323,7 @@ async def ctrl(req: Request):
         body = {}
     token = str(body.get("token") or req.query_params.get("token") or "")
     action = str(body.get("action") or req.query_params.get("action") or "").strip()
-    if action not in ("ai", "select", "back", "up", "down", "exit"):
+    if action not in ("ai", "select", "back", "up", "down", "exit", "work"):
         return JSONResponse({"ok": False, "error": "bad_action"}, status_code=400)
     uid = await resolve_uid(token) if token else ""
     if not uid:
@@ -331,8 +332,12 @@ async def ctrl(req: Request):
     ws = PRODUCERS.get(sid) if sid else None
     if ws is None:
         return JSONResponse({"ok": False, "error": "no_glasses"}, status_code=409)   # 안경 세션 없음
+    # 'work' = 작업 트리거: 안경엔 기존 'ai'(듣기 시작)만 보내고, 다음 발화를 '작업'으로 표시
+    send_action = "ai" if action == "work" else action
+    if action == "work":
+        WORK_PENDING[uid] = time.time()
     try:
-        await ws.send_json({"ctrl": {"action": action}})
+        await ws.send_json({"ctrl": {"action": send_action}})
     except Exception:
         return JSONResponse({"ok": False, "error": "send_failed"}, status_code=502)
     return JSONResponse({"ok": True, "action": action})
@@ -508,6 +513,10 @@ async def stt(ws: WebSocket):
         if not CUE_ON or client is None:
             return
         uid = st.get("uid") or OWNER_UID
+        # 워치 '작업' 트리거: 이 발화를 helper1 작업 큐로 보내도록 '작업 ' 접두어 주입(90초 TTL)
+        _wp = WORK_PENDING.pop(uid, None)
+        if _wp is not None and (time.time() - _wp) <= 90 and not question.startswith("작업"):
+            question = "작업 " + question
         answer = ""
         hws = HELPERS.get(uid)
         # 개인 AI(PC) 미연결 → 기본은 API 폴백 대신 안내 카드. (AI_ALLOW_FALLBACK=1 이면 폴백)
