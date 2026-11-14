@@ -343,6 +343,43 @@ async def ctrl(req: Request):
     return JSONResponse({"ok": True, "action": action})
 
 
+@app.post("/work_card")
+async def work_card(req: Request):
+    # 작업 헬퍼(helper2)가 작업 결과를 해당 사용자의 '안경'에 답변 카드로 띄움.
+    # 안경 세션이 있으면 카드 전송 → delivered:"glasses" (helper2 는 푸시 안 함).
+    # 안경 세션이 없으면 delivered:"none" → helper2 가 그때만 푸시.
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    token = str(body.get("token") or req.query_params.get("token") or "")
+    title = (str(body.get("title") or "").strip() or "작업 결과")
+    text = str(body.get("body") or "").strip()
+    uid = str(body.get("uid") or req.query_params.get("uid") or "").strip()   # helper2 는 큐의 uid 를 직접 넘김
+    if not uid:
+        uid = await resolve_uid(token) if token else ""
+    if not uid:
+        return JSONResponse({"ok": False, "error": "auth"}, status_code=401)
+    sid = GLASSES_BY_UID.get(uid)
+    prod = PRODUCERS.get(sid) if sid else None
+    if prod is None:
+        return JSONResponse({"ok": True, "delivered": "none"})   # 안경 세션 없음 → helper2 가 푸시
+    card_title = (title[:30] + "…") if len(title) > 30 else title
+    try:
+        await prod.send_json({"card": {"type": "answer", "title": card_title, "body": clean_md(text), "src": ""}})
+    except Exception:
+        return JSONResponse({"ok": True, "delivered": "none"})   # 전송 실패 → helper2 가 푸시
+    st = SESSIONS.get(sid)
+    if st is not None:
+        at_iso = now_iso()
+        st["cues"].append({"type": "answer", "title": card_title, "body": text, "q": "작업", "src": "", "at": at_iso, "anchor": at_iso})
+        try:
+            await broadcast(sid, {"ai": {"q": "작업", "a": text}})   # 앱 실시간 보기에도 반영
+        except Exception:
+            pass
+    return JSONResponse({"ok": True, "delivered": "glasses"})
+
+
 @app.websocket("/view")
 async def view(ws: WebSocket):
     await ws.accept()
