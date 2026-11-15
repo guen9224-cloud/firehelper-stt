@@ -8,7 +8,7 @@
 #     ④ 플러그인이 "END"(두 번 탭) 보내면 종료(요약은 앱에서 수동)
 #   키는 전부 Render 환경변수로만. 플러그인/앱엔 아무 키도 안 들어감.
 #     DEEPGRAM_API_KEY / SUPABASE_URL / SUPABASE_ANON_KEY / GLASSES_TOKEN / OWNER_UID
-import os, json, asyncio, time, uuid, re
+import os, json, asyncio, time, uuid, re, hmac
 from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -134,6 +134,14 @@ PRODUCERS: dict = {}  # sid -> WebSocket (안경 producer; AI 답변을 안경�
 TOKEN_UID: dict = {}  # device_token -> uid (페어링 캐시)
 GLASSES_BY_UID: dict = {}  # uid -> sid (워치/폰 원격제어 ctrl 라우팅)
 WORK_PENDING: dict = {}  # uid -> ts (워치 '작업' 트리거: 다음 발화를 helper1 작업큐로 보냄)
+# ── helper2 작업 승인(워치 버튼) ──
+FH_RELAY_KEY = os.environ.get("FH_RELAY_KEY", "")   # fh-work(엣지함수) ↔ 릴레이 공유키. 없으면 승인 기능 꺼짐
+FH_WORK_URL = (SUPABASE_URL + "/functions/v1/fh-work") if SUPABASE_URL else ""
+WORK_CARD_STRICT = os.environ.get("WORK_CARD_STRICT", "0") == "1"   # 1이면 /work_card 도 공유키 필수
+APPROVAL_PENDING: dict = {}  # uid -> {"id": 승인요청 id, "ts": 시각}
+WATCH_STRICT: dict = {}      # uid -> ts (실제 페어링 토큰으로 /ctrl 을 보낸 적 있음 = 워치 승인 가능)
+APPROVAL_TTL = 150           # 초. 이 시간 안의 워치 탭/더블탭만 승인/거절로 처리
+APPROVAL_MIN_DELAY = 2.0     # 초. 카드가 뜬 직후의 탭은 무시(메뉴 조작 중이던 탭이 승인으로 들어가는 실수 방지)
 
 
 def norm_sid(s) -> str:
@@ -328,6 +336,29 @@ async def ctrl(req: Request):
     uid = await resolve_uid(token) if token else ""
     if not uid:
         return JSONResponse({"ok": False, "error": "auth"}, status_code=401)
+    # 승인용 신원: 실제 페어링이 확인된 토큰만(TOKEN_UID 는 glasses_whoami 성공 때만 채워짐). OWNER 폴백은 인정 안 함.
+    suid = TOKEN_UID.get(token.strip(), "")
+    if suid:
+        WATCH_STRICT[suid] = time.time()
+    if action in ("select", "back") and suid:
+        pend = APPROVAL_PENDING.get(suid)
+        if pend and (time.time() - pend.get("ts", 0)) > APPROVAL_TTL:
+            APPROVAL_PENDING.pop(suid, None)
+            pend = None
+        if pend:
+            if (time.time() - pend.get("ts", 0)) < APPROVAL_MIN_DELAY:
+                return JSONResponse({"ok": True, "action": "wait"})   # 너무 빠른 탭: 승인도 전달도 하지 않음
+            decision = "approve" if action == "select" else "deny"
+            res = await _approval_decide(pend.get("id"), suid, decision)
+            if res.get("ok"):
+                APPROVAL_PENDING.pop(suid, None)
+                st = res.get("status") or ("approved" if decision == "approve" else "denied")
+                if res.get("already"):
+                    await _approval_notice(suid, "이미 처리된 요청입니다")
+                else:
+                    await _approval_notice(suid, "승인했습니다" if st == "approved" else "거절했습니다")
+                return JSONResponse({"ok": True, "action": "approve" if st == "approved" else "deny", "status": st})
+            return JSONResponse({"ok": False, "error": "approve_failed"}, status_code=502)
     sid = GLASSES_BY_UID.get(uid)
     ws = PRODUCERS.get(sid) if sid else None
     if ws is None:
@@ -343,6 +374,66 @@ async def ctrl(req: Request):
     return JSONResponse({"ok": True, "action": action})
 
 
+async def _approval_decide(approval_id, uid, decision) -> dict:
+    # 워치 승인/거절을 fh-work 에 기록(공유키). 이미 다른 곳(앱)에서 처리됐으면 already=True 로 돌아옴.
+    if not (FH_RELAY_KEY and FH_WORK_URL and approval_id):
+        return {"ok": False}
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as cli:
+            r = await cli.post(
+                FH_WORK_URL,
+                headers={"Content-Type": "application/json", "Authorization": "Bearer " + SUPABASE_ANON_KEY,
+                         "apikey": SUPABASE_ANON_KEY, "x-fh-relay": FH_RELAY_KEY},
+                json={"action": "approval_decide_relay", "approval_id": approval_id, "uid": uid, "decision": decision},
+            )
+            d = r.json()
+            return d if isinstance(d, dict) else {"ok": False}
+    except Exception:
+        return {"ok": False}
+
+
+async def _approval_notice(uid: str, text: str):
+    sid = GLASSES_BY_UID.get(uid)
+    prod = PRODUCERS.get(sid) if sid else None
+    if prod is None:
+        return
+    try:
+        await prod.send_json({"card": {"type": "answer", "title": "작업 승인", "body": text, "src": ""}})
+    except Exception:
+        pass
+
+
+@app.post("/approve_card")
+async def approve_card(req: Request):
+    # fh-work 가 helper2 의 승인 요청을 안경 카드로 띄우고 워치 승인 대기를 건다. 공유키(x-fh-relay) 필수.
+    _rk = req.headers.get("x-fh-relay", "")
+    if not FH_RELAY_KEY or not _rk or not hmac.compare_digest(_rk, FH_RELAY_KEY):
+        return JSONResponse({"ok": False, "error": "auth"}, status_code=401)
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    uid = str(body.get("uid") or "").strip()
+    approval_id = str(body.get("approval_id") or "").strip()
+    title = (str(body.get("title") or "").strip() or "승인 필요")
+    text = str(body.get("body") or "").strip()
+    if not (uid and approval_id):
+        return JSONResponse({"ok": False, "error": "bad_request"}, status_code=400)
+    watch_ok = uid in WATCH_STRICT
+    sid = GLASSES_BY_UID.get(uid)
+    prod = PRODUCERS.get(sid) if sid else None
+    if prod is None:
+        return JSONResponse({"ok": True, "delivered": "none", "watch": False})   # 안경 세션 없음 → fh-work 가 푸시
+    hint = "워치: 탭=승인 · 두 번 탭=거절" if watch_ok else "앱 채팅에서 승인해 주세요"
+    card_title = (title[:30] + "…") if len(title) > 30 else title
+    try:
+        await prod.send_json({"card": {"type": "answer", "title": card_title, "body": clean_md(text + "\n\n" + hint), "src": ""}})
+    except Exception:
+        return JSONResponse({"ok": True, "delivered": "none", "watch": False})
+    APPROVAL_PENDING[uid] = {"id": approval_id, "ts": time.time()}
+    return JSONResponse({"ok": True, "delivered": "glasses", "watch": watch_ok})
+
+
 @app.post("/work_card")
 async def work_card(req: Request):
     # 작업 헬퍼(helper2)가 작업 결과를 해당 사용자의 '안경'에 답변 카드로 띄움.
@@ -352,6 +443,9 @@ async def work_card(req: Request):
         body = await req.json()
     except Exception:
         body = {}
+    _rk = req.headers.get("x-fh-relay", "")
+    if FH_RELAY_KEY and ((_rk and not hmac.compare_digest(_rk, FH_RELAY_KEY)) or (WORK_CARD_STRICT and not _rk)):
+        return JSONResponse({"ok": False, "error": "auth"}, status_code=401)   # 키가 틀리면 거절(키 없는 기존 helper2 는 WORK_CARD_STRICT=1 전까지 허용)
     token = str(body.get("token") or req.query_params.get("token") or "")
     title = (str(body.get("title") or "").strip() or "작업 결과")
     text = str(body.get("body") or "").strip()
