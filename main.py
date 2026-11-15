@@ -138,10 +138,10 @@ WORK_PENDING: dict = {}  # uid -> ts (워치 '작업' 트리거: 다음 발화�
 FH_RELAY_KEY = os.environ.get("FH_RELAY_KEY", "").strip()   # fh-work(엣지함수) ↔ 릴레이 공유키. 없으면 승인 기능 꺼짐 (앞뒤 공백·줄바꿈은 무시)
 FH_WORK_URL = (SUPABASE_URL + "/functions/v1/fh-work") if SUPABASE_URL else ""
 WORK_CARD_STRICT = os.environ.get("WORK_CARD_STRICT", "0") == "1"   # 1이면 /work_card 도 공유키 필수
-APPROVAL_PENDING: dict = {}  # uid -> {"id": 승인요청 id, "ts": 시각}
-WATCH_STRICT: dict = {}      # uid -> ts (실제 페어링 토큰으로 /ctrl 을 보낸 적 있음 = 워치 승인 가능)
-APPROVAL_TTL = 150           # 초. 이 시간 안의 워치 탭/더블탭만 승인/거절로 처리
-APPROVAL_MIN_DELAY = 2.0     # 초. 카드가 뜬 직후의 탭은 무시(메뉴 조작 중이던 탭이 승인으로 들어가는 실수 방지)
+APPROVAL_IDS: dict = {}      # uid -> {승인요청 id: 보낸 시각}  (릴레이가 그 사용자 안경에 보낸 요청만 결정 가능)
+APPROVAL_KEEP = 35 * 60      # 초. 승인 요청 id 를 기억하는 시간(서버 만료 30분 + 여유)
+APPROVAL_MODAL_TTL = 120     # 초. 안경 승인 창이 떠 있는 시간(헬퍼가 기다리는 시간과 같음)
+# 승인은 안경의 '승인 창' 안에서만 한다(플러그인 cap=appr). 릴레이는 워치 제스처를 가로채지 않고 그대로 넘긴다.
 
 
 def norm_sid(s) -> str:
@@ -337,29 +337,14 @@ async def ctrl(req: Request):
     uid = await resolve_uid(token) if token else ""
     if not uid:
         return JSONResponse({"ok": False, "error": "auth"}, status_code=401)
-    # 승인용 신원: 실제 페어링이 확인된 토큰만(TOKEN_UID 는 glasses_whoami 성공 때만 채워짐). OWNER 폴백은 인정 안 함.
-    suid = TOKEN_UID.get(token.strip(), "")
-    if suid:
-        WATCH_STRICT[suid] = time.time()
-    if action in ("select", "back") and suid:
-        pend = APPROVAL_PENDING.get(suid)
-        if pend and (time.time() - pend.get("ts", 0)) > APPROVAL_TTL:
-            APPROVAL_PENDING.pop(suid, None)
-            pend = None
-        if pend:
-            if (time.time() - pend.get("ts", 0)) < APPROVAL_MIN_DELAY:
-                return JSONResponse({"ok": True, "action": "wait"})   # 너무 빠른 탭: 승인도 전달도 하지 않음
-            decision = "approve" if action == "select" else "deny"
-            res = await _approval_decide(pend.get("id"), suid, decision)
-            if res.get("ok"):
-                APPROVAL_PENDING.pop(suid, None)
-                st = res.get("status") or ("approved" if decision == "approve" else "denied")
-                if res.get("already"):
-                    await _approval_notice(suid, "이미 처리된 요청입니다")
-                else:
-                    await _approval_notice(suid, "승인했습니다" if st == "approved" else "거절했습니다")
-                return JSONResponse({"ok": True, "action": "approve" if st == "approved" else "deny", "status": st})
-            return JSONResponse({"ok": False, "error": "approve_failed"}, status_code=502)
+    # strict = 실제 페어링이 확인된 토큰(TOKEN_UID 는 glasses_whoami 성공 때만 채워짐). OWNER 폴백 토큰은 strict 아님.
+    # 안경 플러그인은 승인 창에서 strict 제스처만 승인/거절로 받아들인다.
+    strict = bool(TOKEN_UID.get(token.strip(), ""))
+    try:
+        n = int(body.get("n") or req.query_params.get("n") or 1)
+    except Exception:
+        n = 1
+    n = max(1, min(n, 10))   # 베젤 스크롤: 여러 칸을 한 번에
     sid = GLASSES_BY_UID.get(uid)
     ws = PRODUCERS.get(sid) if sid else None
     if ws is None:
@@ -369,7 +354,7 @@ async def ctrl(req: Request):
     if action == "work":
         WORK_PENDING[uid] = time.time()
     try:
-        await ws.send_json({"ctrl": {"action": send_action}})
+        await ws.send_json({"ctrl": {"action": send_action, "strict": strict, "n": n}})
     except Exception:
         return JSONResponse({"ok": False, "error": "send_failed"}, status_code=502)
     return JSONResponse({"ok": True, "action": action})
@@ -393,13 +378,27 @@ async def _approval_decide(approval_id, uid, decision) -> dict:
         return {"ok": False}
 
 
-async def _approval_notice(uid: str, text: str):
-    sid = GLASSES_BY_UID.get(uid)
-    prod = PRODUCERS.get(sid) if sid else None
-    if prod is None:
-        return
+def _approval_remember(uid: str, approval_id: str):
+    now = time.time()
+    m = APPROVAL_IDS.setdefault(uid, {})
+    for k in [k for k, v in m.items() if now - v > APPROVAL_KEEP]:
+        m.pop(k, None)
+    m[approval_id] = now
+
+
+async def handle_appr(st: dict, ws, approval_id: str, decision: str):
+    # 안경 승인 창에서 온 결정(APPR <id> approve|deny). 실제 페어링된 안경 세션 + 릴레이가 그 안경에 보낸 요청만 처리.
+    uid = str(st.get("uid") or "")
+    aid = (approval_id or "").strip().lower()
+    res = {"ok": False}
+    known = APPROVAL_IDS.get(uid, {}).get(aid)
+    if (st.get("strict") and uid and decision in ("approve", "deny")
+            and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", aid)
+            and known and (time.time() - known) <= APPROVAL_KEEP):
+        res = await _approval_decide(aid, uid, decision)
     try:
-        await prod.send_json({"card": {"type": "answer", "title": "작업 승인", "body": text, "src": ""}})
+        await ws.send_json({"appr_result": {"id": aid, "ok": bool(res.get("ok")),
+                                            "status": str(res.get("status") or ""), "already": bool(res.get("already"))}})
     except Exception:
         pass
 
@@ -420,19 +419,26 @@ async def approve_card(req: Request):
     text = str(body.get("body") or "").strip()
     if not (uid and approval_id):
         return JSONResponse({"ok": False, "error": "bad_request"}, status_code=400)
-    watch_ok = uid in WATCH_STRICT
     sid = GLASSES_BY_UID.get(uid)
     prod = PRODUCERS.get(sid) if sid else None
     if prod is None:
         return JSONResponse({"ok": True, "delivered": "none", "watch": False})   # 안경 세션 없음 → fh-work 가 푸시
-    hint = "워치: 탭=승인 · 두 번 탭=거절" if watch_ok else "앱 채팅에서 승인해 주세요"
+    st = SESSIONS.get(sid) or {}
+    # 승인 창을 띄울 수 있는 안경: 새 플러그인(cap 에 appr) + 실제 페어링 토큰으로 붙은 세션
+    can_decide = bool(st.get("strict")) and ("appr" in str(st.get("cap") or ""))
     card_title = (title[:30] + "…") if len(title) > 30 else title
     try:
-        await prod.send_json({"card": {"type": "answer", "title": card_title, "body": clean_md(text + "\n\n" + hint), "src": ""}})
+        if can_decide:
+            _approval_remember(uid, approval_id.lower())
+            await prod.send_json({"card": {"type": "approval", "id": approval_id.lower(), "title": card_title,
+                                           "body": clean_md(text), "ttl": APPROVAL_MODAL_TTL, "src": ""}})
+        else:
+            await prod.send_json({"card": {"type": "answer", "title": card_title,
+                                           "body": clean_md(text + "\n\n앱 채팅에서 승인해 주세요"), "src": ""}})
     except Exception:
         return JSONResponse({"ok": True, "delivered": "none", "watch": False})
-    APPROVAL_PENDING[uid] = {"id": approval_id, "ts": time.time()}
-    return JSONResponse({"ok": True, "delivered": "glasses", "watch": watch_ok})
+    # watch=True 는 "안경에서 바로 승인/거절할 수 있다"는 뜻(fh-work 가 이때만 푸시를 생략)
+    return JSONResponse({"ok": True, "delivered": "glasses", "watch": can_decide})
 
 
 @app.post("/work_card")
@@ -461,7 +467,7 @@ async def work_card(req: Request):
         return JSONResponse({"ok": True, "delivered": "none"})   # 안경 세션 없음 → helper2 가 푸시
     card_title = (title[:30] + "…") if len(title) > 30 else title
     try:
-        await prod.send_json({"card": {"type": "answer", "title": card_title, "body": clean_md(text), "src": ""}})
+        await prod.send_json({"card": {"type": "answer", "title": card_title, "body": clean_md(text), "src": "", "hold": 12}})
     except Exception:
         return JSONResponse({"ok": True, "delivered": "none"})   # 전송 실패 → helper2 가 푸시
     st = SESSIONS.get(sid)
@@ -623,6 +629,8 @@ async def stt(ws: WebSocket):
     sid = norm_sid(ws.query_params.get("sid")) or uuid.uuid4().hex
     st = SESSIONS.setdefault(sid, {"lines": [], "cues": []})
     st["uid"] = await resolve_uid(ws.query_params.get("token"))   # 페어링 토큰 → 사용자
+    st["strict"] = (ws.query_params.get("token") or "").strip() in TOKEN_UID   # 실제 페어링이 확인된 안경인가(OWNER 폴백 아님)
+    st["cap"] = (ws.query_params.get("cap") or "")[:60]                          # 플러그인 기능 표시(예: appr1 = 승인 창)
     ai_on = ws.query_params.get("ai", "1") != "0"                    # AI 힌트 on/off
     _secraw = ws.query_params.get("sec")
     secs = set(x for x in (_secraw or "").split(",") if x) if _secraw is not None else None   # 섹션 필터(None=전체)
@@ -718,8 +726,13 @@ async def stt(ws: WebSocket):
         at_iso = now_iso()
         title = (question[:30] + "…") if len(question) > 30 else (question or "AI 답변")
         st["cues"].append({"type": "answer", "title": title, "body": answer, "q": question, "src": "", "at": at_iso, "anchor": at_iso})
+        # '작업 …' 접수 안내는 결과 카드가 따로 오므로 카드 목록에 쌓지 않는다(transient = 잠깐 보였다 사라짐)
+        _is_ack = question.lstrip().startswith("작업") and ("접수" in answer[:60])
+        _card = {"type": "answer", "title": title, "body": clean_md(answer), "src": ""}
+        if _is_ack and "appr" in str(st.get("cap") or ""):
+            _card["transient"] = True
         try:
-            await ws.send_json({"card": {"type": "answer", "title": title, "body": clean_md(answer), "src": ""}})
+            await ws.send_json({"card": _card})
         except Exception:
             pass
         await broadcast(sid, {"ai": {"q": question, "a": answer}})
@@ -939,6 +952,11 @@ async def stt(ws: WebSocket):
                             elif tt == "NOTIFS":
                                 # 안경 알림목록 뷰 → 내 알림 조회해 안경에 전달
                                 asyncio.create_task(fetch_notifs())
+                            elif tt.startswith("APPR "):
+                                # 안경 승인 창: "APPR <승인요청 id> approve|deny"
+                                _pp = t.strip().split()
+                                if len(_pp) == 3:
+                                    asyncio.create_task(handle_appr(st, ws, _pp[1], _pp[2].lower()))
                 except WebSocketDisconnect:
                     pass
                 finally:
