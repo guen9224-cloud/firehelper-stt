@@ -135,7 +135,7 @@ TOKEN_UID: dict = {}  # device_token -> uid (페어링 캐시)
 GLASSES_BY_UID: dict = {}  # uid -> sid (워치/폰 원격제어 ctrl 라우팅)
 WORK_PENDING: dict = {}  # uid -> ts (워치 '작업' 트리거: 다음 발화를 helper1 작업큐로 보냄)
 # ── helper2 작업 승인(워치 버튼) ──
-FH_RELAY_KEY = os.environ.get("FH_RELAY_KEY", "")   # fh-work(엣지함수) ↔ 릴레이 공유키. 없으면 승인 기능 꺼짐
+FH_RELAY_KEY = os.environ.get("FH_RELAY_KEY", "").strip()   # fh-work(엣지함수) ↔ 릴레이 공유키. 없으면 승인 기능 꺼짐 (앞뒤 공백·줄바꿈은 무시)
 FH_WORK_URL = (SUPABASE_URL + "/functions/v1/fh-work") if SUPABASE_URL else ""
 WORK_CARD_STRICT = os.environ.get("WORK_CARD_STRICT", "0") == "1"   # 1이면 /work_card 도 공유키 필수
 APPROVAL_PENDING: dict = {}  # uid -> {"id": 승인요청 id, "ts": 시각}
@@ -198,7 +198,8 @@ async def broadcast(sid: str, obj: dict):
 @app.get("/")
 def health():
     return {"ok": True, "has_key": bool(DG_KEY), "cue": CUE_ON,
-            "sessions": len(SESSIONS), "viewers": sum(len(v) for v in VIEWERS.values())}
+            "sessions": len(SESSIONS), "viewers": sum(len(v) for v in VIEWERS.values()),
+            "approve": bool(FH_RELAY_KEY), "approve_len": len(FH_RELAY_KEY)}   # 승인 공유키가 들어왔는지(값은 내보내지 않음)
 
 
 @app.post("/pair")
