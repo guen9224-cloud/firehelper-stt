@@ -130,6 +130,8 @@ HELPERS: dict = {}        # uid -> 개인 AI 헬퍼 WebSocket (PC에서 아웃�
 HELPER_PENDING: dict = {} # req_id -> asyncio.Future(answer)
 HELPER_PENDING_FULL: dict = {} # req_id -> Future(full/chat answer) — /ask 전용
 HELPER_STREAM: dict = {}  # req_id -> asyncio.Queue — /ask 스트리밍(SSE) 전용
+HELPER_STREAM_WS: dict = {}  # req_id -> 그 요청을 처리 중인 헬퍼 ws (끊기면 스트림 종료 통지)
+HELPER_MAXV: dict = {}  # uid -> (헬퍼 코드버전 v, 마지막으로 본 시각) — 구버전(좀비) 헬퍼가 자리를 뺏지 못하게
 REQ_SID: dict = {}        # req_id -> sid (헬퍼의 뒤이은 say[브리핑 음성]를 해당 세션 뷰어에게 전달)
 VIEWERS: dict = {}    # sid -> set[WebSocket]  (앱 실시간 뷰어들)
 PRODUCERS: dict = {}  # sid -> WebSocket (안경 producer; AI 답변을 안경으로 푸시)
@@ -614,24 +616,32 @@ async def ask(req: Request):
     if body.get("stream"):
         sq = asyncio.Queue()
         HELPER_STREAM[rid] = sq
+        HELPER_STREAM_WS[rid] = hws
         try:
             await hws.send_text(json.dumps({"type": "ask", "id": rid, "q": q, "conversation_id": conv_id, "context": context}, ensure_ascii=False))
         except Exception:
             HELPER_STREAM.pop(rid, None)
-            return {"ok": True, "offline": False, "answer": "", "error": "send_failed"}
+            HELPER_STREAM_WS.pop(rid, None)
+            return {"ok": True, "offline": True}
         async def _gen():
+            _dead = time.time() + 240.0
             try:
+                yield ": ok\n\n"   # 헤더·첫 바이트 즉시 전송(프록시 버퍼링 방지)
                 while True:
                     try:
-                        item = await asyncio.wait_for(sq.get(), timeout=120.0)
+                        item = await asyncio.wait_for(sq.get(), timeout=15.0)
                     except asyncio.TimeoutError:
-                        yield "data: " + json.dumps({"done": True, "text": "", "error": "timeout"}) + "\n\n"
-                        break
+                        if time.time() > _dead:
+                            yield "data: " + json.dumps({"done": True, "text": "", "error": "timeout"}) + "\n\n"
+                            break
+                        yield ": ping\n\n"   # 하트비트(유휴 연결 끊김 방지)
+                        continue
                     yield "data: " + json.dumps(item, ensure_ascii=False) + "\n\n"
                     if item.get("done"):
                         break
             finally:
                 HELPER_STREAM.pop(rid, None)
+                HELPER_STREAM_WS.pop(rid, None)
         return StreamingResponse(_gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     loop = asyncio.get_event_loop()
     fut1 = loop.create_future(); HELPER_PENDING[rid] = fut1
@@ -671,7 +681,26 @@ async def helper_ws(ws: WebSocket):
         await ws.close(code=4401)
         return
     await ws.accept()
+    # 버전 게이트: 같은 사용자의 더 새 버전 헬퍼가 붙어 있거나 최근(15분)까지 있었으면 구버전은 거절.
+    try:
+        hv = int(ws.query_params.get("v") or 0)
+    except Exception:
+        hv = 0
+    _mv, _mts = HELPER_MAXV.get(uid, (0, 0.0))
+    _cur = HELPERS.get(uid)
+    if hv < _mv and (_cur is not None or (time.time() - _mts) < 900):
+        try:
+            await ws.close(code=4409)
+        except Exception:
+            pass
+        return
     HELPERS[uid] = ws
+    HELPER_MAXV[uid] = (hv, time.time())
+    if _cur is not None and _cur is not ws and hv > _mv:
+        try:
+            await _cur.close(code=4409)   # 더 새 버전이 왔으니 구버전 연결 정리
+        except Exception:
+            pass
     try:
         while True:
             raw = await ws.receive_text()
@@ -722,6 +751,14 @@ async def helper_ws(ws: WebSocket):
     finally:
         if HELPERS.get(uid) is ws:
             HELPERS.pop(uid, None)
+            HELPER_MAXV[uid] = (HELPER_MAXV.get(uid, (hv, 0.0))[0], time.time())
+        # 이 헬퍼가 처리 중이던 스트림 요청은 끊김을 통지(앱이 무한 대기하지 않게)
+        for _rid, _w in list(HELPER_STREAM_WS.items()):
+            if _w is ws:
+                _q2 = HELPER_STREAM.get(_rid)
+                if _q2 is not None:
+                    try: _q2.put_nowait({"done": True, "text": "", "error": "helper_disconnected"})
+                    except Exception: pass
 
 
 @app.websocket("/stt")
