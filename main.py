@@ -12,7 +12,7 @@ import os, json, asyncio, time, uuid, re, hmac
 from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 import websockets
 import httpx
 
@@ -129,6 +129,7 @@ SESSIONS: dict = {}   # sid -> {"lines":[{t,at}], "cues":[...], "uid": <사용�
 HELPERS: dict = {}        # uid -> 개인 AI 헬퍼 WebSocket (PC에서 아웃바운드 접속)
 HELPER_PENDING: dict = {} # req_id -> asyncio.Future(answer)
 HELPER_PENDING_FULL: dict = {} # req_id -> Future(full/chat answer) — /ask 전용
+HELPER_STREAM: dict = {}  # req_id -> asyncio.Queue — /ask 스트리밍(SSE) 전용
 REQ_SID: dict = {}        # req_id -> sid (헬퍼의 뒤이은 say[브리핑 음성]를 해당 세션 뷰어에게 전달)
 VIEWERS: dict = {}    # sid -> set[WebSocket]  (앱 실시간 뷰어들)
 PRODUCERS: dict = {}  # sid -> WebSocket (안경 producer; AI 답변을 안경으로 푸시)
@@ -610,6 +611,28 @@ async def ask(req: Request):
     if hws is None:
         return {"ok": True, "offline": True}
     rid = uuid.uuid4().hex
+    if body.get("stream"):
+        sq = asyncio.Queue()
+        HELPER_STREAM[rid] = sq
+        try:
+            await hws.send_text(json.dumps({"type": "ask", "id": rid, "q": q, "conversation_id": conv_id, "context": context}, ensure_ascii=False))
+        except Exception:
+            HELPER_STREAM.pop(rid, None)
+            return {"ok": True, "offline": False, "answer": "", "error": "send_failed"}
+        async def _gen():
+            try:
+                while True:
+                    try:
+                        item = await asyncio.wait_for(sq.get(), timeout=120.0)
+                    except asyncio.TimeoutError:
+                        yield "data: " + json.dumps({"done": True, "text": "", "error": "timeout"}) + "\n\n"
+                        break
+                    yield "data: " + json.dumps(item, ensure_ascii=False) + "\n\n"
+                    if item.get("done"):
+                        break
+            finally:
+                HELPER_STREAM.pop(rid, None)
+        return StreamingResponse(_gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
     loop = asyncio.get_event_loop()
     fut1 = loop.create_future(); HELPER_PENDING[rid] = fut1
     fut2 = loop.create_future(); HELPER_PENDING_FULL[rid] = fut2
@@ -657,6 +680,20 @@ async def helper_ws(ws: WebSocket):
             except Exception:
                 continue
             t = m.get("type")
+            _sq = HELPER_STREAM.get(m.get("id"))
+            if _sq is not None:
+                if t == "app_status":
+                    try: _sq.put_nowait({"status": m.get("text") or ""})
+                    except Exception: pass
+                elif t == "app_delta":
+                    try: _sq.put_nowait({"delta": m.get("text") or ""})
+                    except Exception: pass
+                elif t == "app_done":
+                    try: _sq.put_nowait({"done": True, "text": m.get("text") or ""})
+                    except Exception: pass
+                elif t == "error":
+                    try: _sq.put_nowait({"done": True, "text": "", "error": (m.get("msg") or "error")})
+                    except Exception: pass
             if t in ("answer", "error"):
                 fut = HELPER_PENDING.get(m.get("id"))
                 if fut is not None and not fut.done():
