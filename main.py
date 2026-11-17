@@ -128,6 +128,7 @@ async def fast_law_lookup(client, term: str):
 SESSIONS: dict = {}   # sid -> {"lines":[{t,at}], "cues":[...], "uid": <사용자>}
 HELPERS: dict = {}        # uid -> 개인 AI 헬퍼 WebSocket (PC에서 아웃바운드 접속)
 HELPER_PENDING: dict = {} # req_id -> asyncio.Future(answer)
+HELPER_PENDING_FULL: dict = {} # req_id -> Future(full/chat answer) — /ask 전용
 REQ_SID: dict = {}        # req_id -> sid (헬퍼의 뒤이은 say[브리핑 음성]를 해당 세션 뷰어에게 전달)
 VIEWERS: dict = {}    # sid -> set[WebSocket]  (앱 실시간 뷰어들)
 PRODUCERS: dict = {}  # sid -> WebSocket (안경 producer; AI 답변을 안경으로 푸시)
@@ -573,6 +574,71 @@ async def resolve_helper_uid(token: str):
         return None
 
 
+async def uid_from_jwt(jwt: str):
+    if not (jwt and SUPABASE_URL and SUPABASE_ANON_KEY):
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            r = await c.get(SUPABASE_URL + "/auth/v1/user",
+                            headers={"apikey": SUPABASE_ANON_KEY, "Authorization": "Bearer " + jwt})
+        if r.status_code != 200:
+            return None
+        u = r.json()
+        return u.get("id") if isinstance(u, dict) else None
+    except Exception:
+        return None
+
+
+@app.post("/ask")
+async def ask(req: Request):
+    # 앱 채팅 → PC 헬퍼 온라인이면 그쪽으로, 아니면 offline(앱이 API로 폴백).
+    auth = req.headers.get("authorization", "")
+    jwt = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    q = str(body.get("q") or body.get("message") or "").strip()
+    conv_id = str(body.get("conversation_id") or "").strip()
+    context = str(body.get("context") or "")[:4000]
+    if not q:
+        return {"ok": False, "error": "empty"}
+    uid = await uid_from_jwt(jwt)
+    if not uid:
+        return {"ok": False, "error": "auth"}
+    hws = HELPERS.get(uid)
+    if hws is None:
+        return {"ok": True, "offline": True}
+    rid = uuid.uuid4().hex
+    loop = asyncio.get_event_loop()
+    fut1 = loop.create_future(); HELPER_PENDING[rid] = fut1
+    fut2 = loop.create_future(); HELPER_PENDING_FULL[rid] = fut2
+    try:
+        await hws.send_text(json.dumps({"type": "ask", "id": rid, "q": q, "conversation_id": conv_id, "context": context}, ensure_ascii=False))
+        part1 = ""
+        try:
+            part1 = (await asyncio.wait_for(fut1, timeout=90.0)) or ""
+        except asyncio.TimeoutError:
+            part1 = ""
+        part2 = ""
+        if fut2.done():
+            part2 = fut2.result() or ""
+        elif part1:
+            try:
+                part2 = (await asyncio.wait_for(fut2, timeout=8.0)) or ""
+            except asyncio.TimeoutError:
+                part2 = ""
+        answer = (part2 or part1).strip()
+    except Exception:
+        answer = ""
+    finally:
+        HELPER_PENDING.pop(rid, None)
+        HELPER_PENDING_FULL.pop(rid, None)
+    if not answer:
+        return {"ok": True, "offline": False, "answer": "", "error": "no_answer"}
+    return {"ok": True, "answer": answer}
+
+
 @app.websocket("/helper")
 async def helper_ws(ws: WebSocket):
     # 직원 PC의 개인 AI 헬퍼가 아웃바운드로 접속. per-user 토큰 -> uid 인증(GLASSES_TOKEN 불필요).
@@ -596,6 +662,9 @@ async def helper_ws(ws: WebSocket):
                 if fut is not None and not fut.done():
                     fut.set_result(m.get("text") if t == "answer" else "")
             elif t == "answer_full":
+                _ff = HELPER_PENDING_FULL.get(m.get("id"))
+                if _ff is not None and not _ff.done():
+                    _ff.set_result(m.get("text") or "")
                 # 전체 마크다운 답(part2) → 앱 실시간보기(/view)로만 중계. 안경 하드웨어엔 보내지 않음(짧은 답 유지).
                 _sid = REQ_SID.get(m.get("id"))
                 if _sid:
