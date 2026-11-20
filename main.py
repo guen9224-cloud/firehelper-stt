@@ -480,10 +480,30 @@ async def _watch_token_uid(token: str) -> str:
     return uid if (uid and t in TOKEN_UID) else ""
 
 
+async def _watch_todos(ws: WebSocket, uid: str):
+    # 워치 첫 화면(시계 + 할 일)용: 미완료 할 일을 조회해 요청한 워치에만 보낸다(안경 할일 화면과 같은 조회).
+    # 실패하면 todo_err 만 보낸다 → 워치는 직전 목록을 그대로 둔다.
+    out = None
+    if CUE_ON:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as cli:
+                r = await cli.post(CONV_URL, headers=CONV_HEADERS, json={"action": "glasses_todos", "uid": uid})
+            d = r.json()
+            if r.status_code == 200 and isinstance(d.get("todos"), list):
+                out = [{"title": str(x.get("title") or "")[:60], "due": str(x.get("due") or "")[:10]}
+                       for x in d["todos"][:15] if isinstance(x, dict) and x.get("title")]
+        except Exception:
+            out = None
+    try:
+        await ws.send_json({"todos": out} if out is not None else {"todo_err": 1})
+    except Exception:
+        pass
+
+
 @app.websocket("/watch")
 async def watch_ws(ws: WebSocket):
     # 워치 수신 연결: 질문(asked)·진행 단계(status)·답변(answer)·승인 요청(appr)·사진(image)을 받는다.
-    # 워치 → 서버: {"type":"ping"} / {"type":"appr","id":..,"decision":"approve|deny"}
+    # 워치 → 서버: {"type":"ping"} / {"type":"appr","id":..,"decision":"approve|deny"} / {"type":"todos"}
     await ws.accept()
     uid = await _watch_token_uid(ws.headers.get("x-fh-token") or ws.query_params.get("token") or "")
     if not uid:
@@ -494,6 +514,7 @@ async def watch_ws(ws: WebSocket):
             pass
         return
     WATCHES.setdefault(uid, set()).add(ws)
+    _todo_at = 0.0
     try:
         _gs = GLASSES_BY_UID.get(uid)
         await ws.send_json({"hello": {"glasses": bool(_gs and PRODUCERS.get(_gs) is not None),
@@ -507,6 +528,11 @@ async def watch_ws(ws: WebSocket):
             t = m.get("type")
             if t == "ping":
                 await ws.send_json({"pong": 1})
+            elif t == "todos":
+                # 조회가 끝날 때까지 이 연결의 다른 메시지(승인 등)를 막지 않도록 따로 돌린다. 5초 안의 반복 요청은 무시.
+                if time.time() - _todo_at >= 5.0:
+                    _todo_at = time.time()
+                    asyncio.create_task(_watch_todos(ws, uid))
             elif t == "appr":
                 aid = str(m.get("id") or "").strip().lower()
                 decision = str(m.get("decision") or "")
