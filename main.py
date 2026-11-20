@@ -723,6 +723,15 @@ async def helper_ws(ws: WebSocket):
                 elif t == "error":
                     try: _sq.put_nowait({"done": True, "text": "", "error": (m.get("msg") or "error")})
                     except Exception: pass
+            elif t == "app_status":
+                # 안경에서 한 질문(REQ_SID 에 세션이 있음): 헬퍼의 진행 단계(법령 조회·답변 작성 등)를 안경에 전달 (2026-11-20)
+                _gsid = REQ_SID.get(m.get("id"))
+                _gws = PRODUCERS.get(_gsid) if _gsid else None
+                if _gws is not None:
+                    try:
+                        await _gws.send_json({"ai_status": str(m.get("text") or "")[:40]})
+                    except Exception:
+                        pass
             if t in ("answer", "error"):
                 fut = HELPER_PENDING.get(m.get("id"))
                 if fut is not None and not fut.done():
