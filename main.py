@@ -137,6 +137,7 @@ VIEWERS: dict = {}    # sid -> set[WebSocket]  (앱 실시간 뷰어들)
 PRODUCERS: dict = {}  # sid -> WebSocket (안경 producer; AI 답변을 안경으로 푸시)
 TOKEN_UID: dict = {}  # device_token -> uid (페어링 캐시)
 GLASSES_BY_UID: dict = {}  # uid -> sid (워치/폰 원격제어 ctrl 라우팅)
+WATCHES: dict = {}  # uid -> set(워치 수신 WebSocket). 답변·진행 단계·승인 요청·사진을 워치로 보냄 (2026-11-20)
 WORK_PENDING: dict = {}  # uid -> ts (워치 '작업' 트리거: 다음 발화를 helper1 작업큐로 보냄)
 # ── helper2 작업 승인(워치 버튼) ──
 FH_RELAY_KEY = os.environ.get("FH_RELAY_KEY", "").strip()   # fh-work(엣지함수) ↔ 릴레이 공유키. 없으면 승인 기능 꺼짐 (앞뒤 공백·줄바꿈은 무시)
@@ -172,6 +173,15 @@ async def resolve_uid(device_token: str) -> str:
     except Exception:
         pass
     return OWNER_UID
+
+
+async def watch_send(uid: str, msg: dict):
+    # 그 사용자의 워치(들)에 한 줄 보낸다. 워치가 없거나 끊겼으면 조용히 넘어간다.
+    for _w in list(WATCHES.get(uid) or ()):
+        try:
+            await _w.send_json(msg)
+        except Exception:
+            pass
 
 
 def clean_md(t: str) -> str:
@@ -336,7 +346,7 @@ async def ctrl(req: Request):
         body = {}
     token = str(body.get("token") or req.query_params.get("token") or "")
     action = str(body.get("action") or req.query_params.get("action") or "").strip()
-    if action not in ("ai", "select", "back", "up", "down", "exit", "work"):
+    if action not in ("ai", "select", "back", "up", "down", "exit", "work", "ping", "dismiss"):
         return JSONResponse({"ok": False, "error": "bad_action"}, status_code=400)
     uid = await resolve_uid(token) if token else ""
     if not uid:
@@ -351,12 +361,12 @@ async def ctrl(req: Request):
     n = max(1, min(n, 10))   # 베젤 스크롤: 여러 칸을 한 번에
     sid = GLASSES_BY_UID.get(uid)
     ws = PRODUCERS.get(sid) if sid else None
+    if action == "ping":   # 워치 설정의 '연결 확인': 안경엔 아무 것도 보내지 않고 상태만 알려준다 (2026-11-20)
+        return JSONResponse({"ok": True, "action": "ping", "glasses": ws is not None, "helper": HELPERS.get(uid) is not None})
     if ws is None:
         return JSONResponse({"ok": False, "error": "no_glasses"}, status_code=409)   # 안경 세션 없음
-    # 'work' = 작업 트리거: 안경엔 기존 'ai'(듣기 시작)만 보내고, 다음 발화를 '작업'으로 표시
+    # 'work'(옛 워치 앱의 작업 버튼)는 'ai'와 같게 처리한다. '작업' 접두어·작업 큐는 없앰 (2026-11-20)
     send_action = "ai" if action == "work" else action
-    if action == "work":
-        WORK_PENDING[uid] = time.time()
     try:
         await ws.send_json({"ctrl": {"action": send_action, "strict": strict, "n": n}})
     except Exception:
@@ -400,11 +410,14 @@ async def handle_appr(st: dict, ws, approval_id: str, decision: str):
             and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", aid)
             and known and (time.time() - known) <= APPROVAL_KEEP):
         res = await _approval_decide(aid, uid, decision)
+    _out = {"appr_result": {"id": aid, "ok": bool(res.get("ok")),
+                            "status": str(res.get("status") or ""), "already": bool(res.get("already"))}}
     try:
-        await ws.send_json({"appr_result": {"id": aid, "ok": bool(res.get("ok")),
-                                            "status": str(res.get("status") or ""), "already": bool(res.get("already"))}})
+        await ws.send_json(_out)
     except Exception:
         pass
+    if uid:
+        await watch_send(uid, _out)   # 워치에 떠 있는 승인 요청도 같이 닫는다
 
 
 @app.post("/approve_card")
@@ -423,6 +436,12 @@ async def approve_card(req: Request):
     text = str(body.get("body") or "").strip()
     if not (uid and approval_id):
         return JSONResponse({"ok": False, "error": "bad_request"}, status_code=400)
+    card_title = (title[:30] + "…") if len(title) > 30 else title
+    # 워치(실제 페어링 토큰으로 붙은 것만 WATCHES 에 있음)에도 승인 요청을 띄운다. 워치만 있을 땐 푸시도 그대로 나간다.
+    if WATCHES.get(uid):
+        _approval_remember(uid, approval_id.lower())
+        await watch_send(uid, {"appr": {"id": approval_id.lower(), "title": card_title,
+                                        "body": clean_md(text), "ttl": APPROVAL_MODAL_TTL}})
     sid = GLASSES_BY_UID.get(uid)
     prod = PRODUCERS.get(sid) if sid else None
     if prod is None:
@@ -430,7 +449,6 @@ async def approve_card(req: Request):
     st = SESSIONS.get(sid) or {}
     # 승인 창을 띄울 수 있는 안경: 새 플러그인(cap 에 appr) + 실제 페어링 토큰으로 붙은 세션
     can_decide = bool(st.get("strict")) and ("appr" in str(st.get("cap") or ""))
-    card_title = (title[:30] + "…") if len(title) > 30 else title
     try:
         if can_decide:
             _approval_remember(uid, approval_id.lower())
@@ -443,6 +461,133 @@ async def approve_card(req: Request):
         return JSONResponse({"ok": True, "delivered": "none", "watch": False})
     # watch=True 는 "안경에서 바로 승인/거절할 수 있다"는 뜻(fh-work 가 이때만 푸시를 생략)
     return JSONResponse({"ok": True, "delivered": "glasses", "watch": can_decide})
+
+
+def _wav_wrap(pcm: bytes, sr: int = 16000) -> bytes:
+    # 16비트 모노 PCM 앞에 WAV 머리말을 붙인다.
+    import struct
+    n = len(pcm)
+    return (b"RIFF" + struct.pack("<I", 36 + n) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, sr, sr * 2, 2, 16)
+            + b"data" + struct.pack("<I", n) + pcm)
+
+
+async def _watch_token_uid(token: str) -> str:
+    # 워치 수신·단독 질문은 실제 페어링이 확인된 토큰만 허용(OWNER 폴백 불가).
+    t = (token or "").strip()
+    if not t:
+        return ""
+    uid = await resolve_uid(t)
+    return uid if (uid and t in TOKEN_UID) else ""
+
+
+@app.websocket("/watch")
+async def watch_ws(ws: WebSocket):
+    # 워치 수신 연결: 질문(asked)·진행 단계(status)·답변(answer)·승인 요청(appr)·사진(image)을 받는다.
+    # 워치 → 서버: {"type":"ping"} / {"type":"appr","id":..,"decision":"approve|deny"}
+    await ws.accept()
+    uid = await _watch_token_uid(ws.headers.get("x-fh-token") or ws.query_params.get("token") or "")
+    if not uid:
+        try:
+            await ws.send_json({"error": "auth"})
+            await ws.close(code=4401)
+        except Exception:
+            pass
+        return
+    WATCHES.setdefault(uid, set()).add(ws)
+    try:
+        _gs = GLASSES_BY_UID.get(uid)
+        await ws.send_json({"hello": {"glasses": bool(_gs and PRODUCERS.get(_gs) is not None),
+                                      "helper": HELPERS.get(uid) is not None}})
+        while True:
+            raw = await ws.receive_text()
+            try:
+                m = json.loads(raw)
+            except Exception:
+                continue
+            t = m.get("type")
+            if t == "ping":
+                await ws.send_json({"pong": 1})
+            elif t == "appr":
+                aid = str(m.get("id") or "").strip().lower()
+                decision = str(m.get("decision") or "")
+                res = {"ok": False}
+                known = APPROVAL_IDS.get(uid, {}).get(aid)
+                if (decision in ("approve", "deny")
+                        and re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", aid)
+                        and known and (time.time() - known) <= APPROVAL_KEEP):
+                    res = await _approval_decide(aid, uid, decision)
+                _out = {"appr_result": {"id": aid, "ok": bool(res.get("ok")),
+                                        "status": str(res.get("status") or ""), "already": bool(res.get("already"))}}
+                await watch_send(uid, _out)
+                _gs = GLASSES_BY_UID.get(uid)
+                _gp = PRODUCERS.get(_gs) if _gs else None
+                if _gp is not None:   # 안경에 같은 승인 창이 떠 있으면 같이 닫힌다
+                    try:
+                        await _gp.send_json(_out)
+                    except Exception:
+                        pass
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        _set = WATCHES.get(uid)
+        if _set is not None:
+            _set.discard(ws)
+            if not _set:
+                WATCHES.pop(uid, None)
+
+
+async def _watch_ask_run(uid: str, q: str):
+    # 워치 단독 질문: PC 헬퍼에 묻고, 답을 워치로 보낸다(앱 채팅 기록은 헬퍼가 남긴다).
+    await watch_send(uid, {"asked": q})
+    answer = ""
+    hws = HELPERS.get(uid)
+    if hws is not None:
+        rid = uuid.uuid4().hex
+        fut = asyncio.get_event_loop().create_future()
+        HELPER_PENDING[rid] = fut
+        try:
+            await hws.send_text(json.dumps({"type": "ask", "id": rid, "q": q + "\n\n(반드시 한국어로, 핵심만 2~4문장 간결하게.)"}, ensure_ascii=False))
+            answer = (await asyncio.wait_for(fut, timeout=90.0)) or ""
+        except Exception:
+            answer = ""
+        finally:
+            HELPER_PENDING.pop(rid, None)
+    answer = clean_md(answer or "")
+    await watch_send(uid, {"answer": {"q": q, "text": answer, "ok": bool(answer)}})
+
+
+@app.post("/watch_ask")
+async def watch_ask(req: Request):
+    # 워치 단독 질문: 본문 = 16kHz 16비트 모노 PCM(누르고 있는 동안 녹음). 글자로 바꿔 헬퍼에 묻는다.
+    uid = await _watch_token_uid(req.headers.get("x-fh-token") or "")
+    if not uid:
+        return JSONResponse({"ok": False, "error": "auth"}, status_code=401)
+    pcm = await req.body()
+    if len(pcm) < 9600:
+        return JSONResponse({"ok": False, "error": "too_short"})
+    if len(pcm) > 1200000:
+        return JSONResponse({"ok": False, "error": "too_long"}, status_code=413)
+    if HELPERS.get(uid) is None:
+        return JSONResponse({"ok": False, "error": "no_helper"})
+    if not DG_KEY:
+        return JSONResponse({"ok": False, "error": "no_stt"}, status_code=500)
+    q = ""
+    try:
+        _u = ("https://api.deepgram.com/v1/listen?model=nova-3&language=ko&punctuate=true&smart_format=true"
+              + "".join("&keyterm=" + _up.quote(t) for t in DG_KEYTERMS))
+        async with httpx.AsyncClient(timeout=30.0) as cli:
+            r = await cli.post(_u, headers={"Authorization": "Token " + DG_KEY, "Content-Type": "audio/wav"},
+                               content=_wav_wrap(pcm))
+            d = r.json()
+            q = str(d["results"]["channels"][0]["alternatives"][0].get("transcript") or "").strip()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "stt_failed"}, status_code=502)
+    if not q:
+        return JSONResponse({"ok": False, "error": "no_speech"})
+    asyncio.create_task(_watch_ask_run(uid, q))
+    return JSONResponse({"ok": True, "q": q})
 
 
 @app.post("/work_card")
@@ -732,17 +877,28 @@ async def helper_ws(ws: WebSocket):
                         await _gws.send_json({"ai_status": str(m.get("text") or "")[:40]})
                     except Exception:
                         pass
+                await watch_send(uid, {"status": str(m.get("text") or "")[:40]})   # 워치에도 진행 단계
             elif t == "glasses_image":
-                # 안경에서 한 질문의 CCTV 사진(288x144·4비트 회색조, 두 픽셀=1바이트 base64)을 그 안경에 전달 (2026-11-20)
+                # 안경·워치에서 한 질문의 CCTV 사진. data = 안경용 288x144·4비트 회색조(두 픽셀=1바이트 base64),
+                # jpeg = 워치용 작은 컬러 사진(base64). 안경엔 회색조, 워치엔 둘 다 보낸다(워치가 컬러를 우선 사용).
                 _gsid = REQ_SID.get(m.get("id"))
                 _gws = PRODUCERS.get(_gsid) if _gsid else None
                 _gd = str(m.get("data") or "")
-                if _gws is not None and _gd and len(_gd) <= 40000:
+                if len(_gd) > 40000:
+                    _gd = ""
+                _gj = str(m.get("jpeg") or "")
+                if len(_gj) > 200000:
+                    _gj = ""
+                _glabel = str(m.get("label") or "")[:30]
+                _gw, _gh = int(m.get("w") or 288), int(m.get("h") or 144)
+                if _gws is not None and _gd:
                     try:
-                        await _gws.send_json({"image": {"w": int(m.get("w") or 288), "h": int(m.get("h") or 144),
-                                                        "label": str(m.get("label") or "")[:30], "data": _gd}})
+                        await _gws.send_json({"image": {"w": _gw, "h": _gh, "label": _glabel, "data": _gd}})
                     except Exception:
                         pass
+                if _gd or _gj:
+                    await watch_send(uid, {"image": {"w": _gw, "h": _gh, "label": _glabel,
+                                                     "jpeg": _gj, "data": ("" if _gj else _gd)}})
             if t in ("answer", "error"):
                 fut = HELPER_PENDING.get(m.get("id"))
                 if fut is not None and not fut.done():
@@ -816,10 +972,6 @@ async def stt(ws: WebSocket):
         if not CUE_ON or client is None:
             return
         uid = st.get("uid") or OWNER_UID
-        # 워치 '작업' 트리거: 이 발화를 helper1 작업 큐로 보내도록 '작업 ' 접두어 주입(90초 TTL)
-        _wp = WORK_PENDING.pop(uid, None)
-        if _wp is not None and (time.time() - _wp) <= 90 and not question.startswith("작업"):
-            question = "작업 " + question
         answer = ""
         hws = HELPERS.get(uid)
         # 개인 AI(PC) 미연결 → 기본은 API 폴백 대신 안내 카드. (AI_ALLOW_FALLBACK=1 이면 폴백)
@@ -885,7 +1037,9 @@ async def stt(ws: WebSocket):
                 await ws.send_json({"cue_err": "AI 답변 비어있음"})
             except Exception:
                 pass
+            await watch_send(uid, {"answer": {"q": question, "text": "", "ok": False}})
             return
+        await watch_send(uid, {"answer": {"q": question, "text": clean_md(answer), "ok": True}})   # 워치에 답(글자·음성)
         at_iso = now_iso()
         title = (question[:30] + "…") if len(question) > 30 else (question or "AI 답변")
         st["cues"].append({"type": "answer", "title": title, "body": answer, "q": question, "src": "", "at": at_iso, "anchor": at_iso})
@@ -1062,6 +1216,7 @@ async def stt(ws: WebSocket):
                             await ws.send_json({"asked": latest})   # 안경에 질문 문장 표시
                         except Exception:
                             pass
+                        await watch_send(st.get("uid") or OWNER_UID, {"asked": latest})   # 워치에도
                         asyncio.create_task(fetch_ai_answer(latest))   # 서버가 직접 AI 호출(카드 없이)
                     else:
                         core = "".join(ch for ch in latest if ch.isalnum())
