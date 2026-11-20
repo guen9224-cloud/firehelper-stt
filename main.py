@@ -732,6 +732,17 @@ async def helper_ws(ws: WebSocket):
                         await _gws.send_json({"ai_status": str(m.get("text") or "")[:40]})
                     except Exception:
                         pass
+            elif t == "glasses_image":
+                # 안경에서 한 질문의 CCTV 사진(288x144·4비트 회색조, 두 픽셀=1바이트 base64)을 그 안경에 전달 (2026-11-20)
+                _gsid = REQ_SID.get(m.get("id"))
+                _gws = PRODUCERS.get(_gsid) if _gsid else None
+                _gd = str(m.get("data") or "")
+                if _gws is not None and _gd and len(_gd) <= 40000:
+                    try:
+                        await _gws.send_json({"image": {"w": int(m.get("w") or 288), "h": int(m.get("h") or 144),
+                                                        "label": str(m.get("label") or "")[:30], "data": _gd}})
+                    except Exception:
+                        pass
             if t in ("answer", "error"):
                 fut = HELPER_PENDING.get(m.get("id"))
                 if fut is not None and not fut.done():
