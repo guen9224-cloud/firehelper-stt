@@ -656,6 +656,38 @@ async def work_card(req: Request):
     return JSONResponse({"ok": True, "delivered": "glasses"})
 
 
+@app.post("/chat_notify")
+async def chat_notify(req: Request):
+    # 업무방 새 글 알림(2026-11-21): fh-chat(엣지 함수)이 푸시를 보낼 때 함께 부른다.
+    # 받은 사용자들 가운데 안경이 연결된 사람에게는 카드를, 워치가 붙어 있는 사람에게는 진동·표시를 보낸다.
+    # 대화 기록(cues)·앱 실시간 보기에는 남기지 않는다(알림일 뿐 AI 답변이 아니므로).
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    _rk = req.headers.get("x-fh-relay", "")
+    if not FH_RELAY_KEY or not _rk or not hmac.compare_digest(_rk, FH_RELAY_KEY):
+        return JSONResponse({"ok": False, "error": "auth"}, status_code=401)
+    uids = [str(u).strip() for u in (body.get("uids") or []) if str(u).strip()][:50]
+    title = (str(body.get("title") or "").strip() or "업무방")[:30]
+    text = clean_md(str(body.get("body") or ""))[:300]
+    n_glasses = 0
+    n_watch = 0
+    for uid in uids:
+        sid = GLASSES_BY_UID.get(uid)
+        prod = PRODUCERS.get(sid) if sid else None
+        if prod is not None:
+            try:
+                await prod.send_json({"card": {"type": "answer", "title": title, "body": text, "src": "", "hold": 8}})
+                n_glasses += 1
+            except Exception:
+                pass
+        if WATCHES.get(uid):
+            await watch_send(uid, {"answer": {"q": title, "text": text, "ok": True}})
+            n_watch += 1
+    return JSONResponse({"ok": True, "glasses": n_glasses, "watch": n_watch})
+
+
 @app.websocket("/view")
 async def view(ws: WebSocket):
     await ws.accept()
