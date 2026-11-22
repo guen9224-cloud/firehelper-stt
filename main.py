@@ -519,6 +519,8 @@ async def watch_ws(ws: WebSocket):
         _gs = GLASSES_BY_UID.get(uid)
         await ws.send_json({"hello": {"glasses": bool(_gs and PRODUCERS.get(_gs) is not None),
                                       "helper": HELPERS.get(uid) is not None}})
+        _gb = (SESSIONS.get(_gs) or {}).get("bat") if (_gs and PRODUCERS.get(_gs) is not None) else None
+        await ws.send_json({"bat": _gb or {"g": -1, "p": -1}})   # 안경이 연결돼 있으면 마지막 배터리 값, 아니면 숨김
         while True:
             raw = await ws.receive_text()
             try:
@@ -1328,6 +1330,15 @@ async def stt(ws: WebSocket):
                             elif tt == "NOTIFS":
                                 # 안경 알림목록 뷰 → 내 알림 조회해 안경에 전달
                                 asyncio.create_task(fetch_notifs())
+                            elif tt.startswith("BAT "):
+                                # 안경 플러그인이 알려 주는 배터리: "BAT <안경 %> <폰 %>" (모르면 -1) → 워치 어두운 화면에 표시
+                                _bp = tt.split()
+                                try:
+                                    _bg = int(_bp[1]); _bph = int(_bp[2])
+                                    st["bat"] = {"g": _bg if 0 <= _bg <= 100 else -1, "p": _bph if 0 <= _bph <= 100 else -1}
+                                    await watch_send(st.get("uid") or OWNER_UID, {"bat": st["bat"]})
+                                except Exception:
+                                    pass
                             elif tt.startswith("APPR "):
                                 # 안경 승인 창: "APPR <승인요청 id> approve|deny"
                                 _pp = t.strip().split()
@@ -1398,6 +1409,10 @@ async def stt(ws: WebSocket):
             _u = st.get("uid")
             if _u and GLASSES_BY_UID.get(_u) == sid:
                 GLASSES_BY_UID.pop(_u, None)
+                try:   # 안경 연결이 끊기면 워치의 안경·폰 배터리 표시를 숨긴다
+                    await watch_send(_u, {"bat": {"g": -1, "p": -1}})
+                except Exception:
+                    pass
         if end_requested["v"]:
             SESSIONS.pop(sid, None)
         try:
