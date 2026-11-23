@@ -957,7 +957,10 @@ async def helper_ws(ws: WebSocket):
                     try: _sq.put_nowait({"delta": m.get("text") or ""})
                     except Exception: pass
                 elif t == "app_done":
-                    try: _sq.put_nowait({"done": True, "text": m.get("text") or ""})
+                    _dn = {"done": True, "text": m.get("text") or ""}
+                    if m.get("spoken"):   # 브리핑처럼 헬퍼가 읽어줄 문장을 따로 만들어 준 경우(2026-11-23)
+                        _dn["spoken"] = str(m.get("spoken"))[:2000]; _dn["spoken_made"] = True
+                    try: _sq.put_nowait(_dn)
                     except Exception: pass
                 elif t == "answer":
                     # 읽어줄 문장(답의 앞부분) → 앱에도 전달. 앱이 소리로 읽을 때 이 문장을 그대로 쓴다(따로 요약하지 않음). 2026-11-23
