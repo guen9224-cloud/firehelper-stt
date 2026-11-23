@@ -191,6 +191,28 @@ def clean_md(t: str) -> str:
     return t.strip()
 
 
+WATCH_SAY = {}        # 워치 질문 id -> 읽어줄 문장(say)을 기다리는 future
+WATCH_SAY_FLAG = set()   # 헬퍼가 "읽어줄 문장이 곧 따라온다"고 알린 워치 질문 id
+_WD = {"월": "월요일", "화": "화요일", "수": "수요일", "목": "목요일", "금": "금요일", "토": "토요일", "일": "일요일"}
+
+
+def speech_clean(t: str) -> str:
+    # 워치가 소리로 읽을 글 다듬기(2026-11-23): 이모티콘·기호를 빼고, 날짜 표기를 말로 바꾼다.
+    # 워치는 화면 글자를 그대로 읽으므로 워치 질문의 답에만 쓴다(안경·앱·업무방 알림은 그대로).
+    t = t or ""
+    t = re.sub(r"(?<!\d)(\d{4})[-./](\d{1,2})[-./](\d{1,2})(?!\d)", lambda m: "%s년 %d월 %d일" % (m.group(1), int(m.group(2)), int(m.group(3))), t)
+    # 11/24(화) 처럼 요일이 붙은 것만 날짜로 본다(1/30 같은 분수·비율은 건드리지 않는다)
+    t = re.sub(r"(?<![\d/])(\d{1,2})/(\d{1,2})\s*\(([월화수목금토일])\)", lambda m: "%d월 %d일 %s" % (int(m.group(1)), int(m.group(2)), _WD[m.group(3)]), t)
+    t = re.sub(r"(일)\s*\(([월화수목금토일])\)", lambda m: m.group(1) + " " + _WD[m.group(2)], t)
+    t = re.sub(r"(?<=[\d일])\s*[~∼〜]\s*(?=\d)", "부터 ", t)
+    t = re.sub(r"[\U0001F000-\U0001FAFF\U0001F1E6-\U0001F1FF\u2600-\u27BF\u2B00-\u2BFF\u2190-\u21FF\u25A0-\u25FF\uFE0F\u200D\u20E3]", " ", t)
+    t = re.sub(r"[·•ㆍ∙※|\[\]{}<>=^\\]", " ", t)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r" *\n *", "\n", t)
+    t = re.sub(r"\n{2,}", "\n", t)
+    return t.strip()
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -575,14 +597,26 @@ async def _watch_ask_run(uid: str, q: str):
         rid = uuid.uuid4().hex
         fut = asyncio.get_event_loop().create_future()
         HELPER_PENDING[rid] = fut
+        sfut = asyncio.get_event_loop().create_future()
+        WATCH_SAY[rid] = sfut
         try:
             await hws.send_text(json.dumps({"type": "ask", "id": rid, "q": q + "\n\n(반드시 한국어로, 핵심만 2~4문장 간결하게.)"}, ensure_ascii=False))
             answer = (await asyncio.wait_for(fut, timeout=90.0)) or ""
+            # 브리핑처럼 화면용 카드가 먼저 오는 답: 헬퍼가 곧 보내는 "읽어줄 문장"을 잠깐 기다려 그걸 워치에 보낸다(못 받으면 카드를 다듬어 읽는다).
+            if answer and rid in WATCH_SAY_FLAG:
+                try:
+                    _say = (await asyncio.wait_for(sfut, timeout=8.0)) or ""
+                    if _say.strip():
+                        answer = _say
+                except Exception:
+                    pass
         except Exception:
             answer = ""
         finally:
             HELPER_PENDING.pop(rid, None)
-    answer = clean_md(answer or "")
+            WATCH_SAY.pop(rid, None)
+            WATCH_SAY_FLAG.discard(rid)
+    answer = speech_clean(clean_md(answer or ""))
     await watch_send(uid, {"answer": {"q": q, "text": answer, "ok": bool(answer)}})
 
 
@@ -964,6 +998,8 @@ async def helper_ws(ws: WebSocket):
                     await watch_send(uid, {"image": {"w": _gw, "h": _gh, "label": _glabel,
                                                      "jpeg": _gj, "data": ("" if _gj else _gd)}})
             if t in ("answer", "error"):
+                if t == "answer" and m.get("say_follows") and m.get("id") in WATCH_SAY:
+                    WATCH_SAY_FLAG.add(m.get("id"))
                 fut = HELPER_PENDING.get(m.get("id"))
                 if fut is not None and not fut.done():
                     fut.set_result(m.get("text") if t == "answer" else "")
@@ -976,6 +1012,9 @@ async def helper_ws(ws: WebSocket):
                 if _sid:
                     asyncio.create_task(broadcast(_sid, {"ai_full": {"id": m.get("id"), "text": m.get("text") or ""}}))
             elif t == "say":
+                _wsf = WATCH_SAY.get(m.get("id"))
+                if _wsf is not None and not _wsf.done():
+                    _wsf.set_result(m.get("text") or "")
                 _sid = REQ_SID.get(m.get("id"))
                 if _sid:
                     asyncio.create_task(broadcast(_sid, {"say": {"id": m.get("id"), "text": m.get("text") or ""}}))
